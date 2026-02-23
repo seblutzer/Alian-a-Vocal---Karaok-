@@ -246,15 +246,35 @@ public class LearningMode {
         if (voiceRecorder == null || sharedMic == null) return;
         if (!recordSwitch.isSelected()) return;
 
-        String rawLabel = merged.label.replaceAll("^\\d+\\.\\s*", "").trim();
-        String prefix   = musicName.isBlank() ? "" : musicName + " - ";
-        String fileName = prefix + voiceName + " - " + rawLabel;
+        String fileName = buildRecordingName(merged);
 
         voiceRecorder.setOutputName(fileName);
         sharedMic.addConsumer(voiceRecorder);
         voiceRecorder.start();
         startBlinking();
         System.out.println("[LearningMode] Gravando: " + fileName);
+    }
+
+    private String buildRecordingName(Segment seg) {
+        String numPart    = String.valueOf(seg.index + 1);
+        String trechoPart = stripNumericPrefix(seg.label);
+        String core       = voiceName + " - " + numPart + " - " + trechoPart;
+        return musicName.isBlank() ? core : musicName + " - " + core;
+    }
+
+    private String buildRecordingName(MergedSegment merged) {
+        if (merged.sources.size() == 1) return buildRecordingName(merged.sources.get(0));
+
+        Segment first = merged.sources.get(0);
+        Segment last  = merged.sources.get(merged.sources.size() - 1);
+        String numPart    = (first.index + 1) + "-" + (last.index + 1);
+        String trechoPart = stripNumericPrefix(first.label) + " - " + stripNumericPrefix(last.label);
+        String core = voiceName + " - " + numPart + " - " + trechoPart;
+        return musicName.isBlank() ? core : musicName + " - " + core;
+    }
+
+    private String stripNumericPrefix(String label) {
+        return label.replaceAll("^\\d+\\.\\s*", "").trim();
     }
 
     private void stopRecordingIfActive() {

@@ -1,4 +1,3 @@
-
 package com.karaoke;
 
 import javax.sound.sampled.*;
@@ -12,7 +11,11 @@ import java.util.Date;
  *
  * O nome do arquivo pode ser definido via {@link #setOutputName(String)}
  * antes de chamar {@link #start()}. Se não definido, usa timestamp.
- * Formato: "{outputName}_voz.wav/.mp3"
+ *
+ * Prioridade de formato de saída:
+ *  1. Opus  — se FFmpeg estiver disponível ({@link FFmpegDetector#isAvailable()})
+ *  2. MP3   — se LAME estiver disponível no PATH
+ *  3. WAV   — fallback final
  */
 public class VoiceRecorder implements SharedMicrophone.Consumer {
 
@@ -29,7 +32,6 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
     /**
      * Nome base do arquivo de saída (sem extensão).
      * Se {@code null}, usa timestamp automático.
-     * Caracteres inválidos para nomes de arquivo são sanitizados em {@link #start()}.
      */
     private String outputName = null;
 
@@ -47,8 +49,7 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
      * Define o nome base do arquivo de saída.
      * Deve ser chamado antes de {@link #start()}.
      *
-     * @param name nome desejado, ex: {@code "Soprano - Trecho 1 \"Kyrie\""}.
-     *             Caracteres {@code \ / : * ? " < > |} são substituídos por {@code _}.
+     * @param name nome desejado — caracteres inválidos são substituídos por {@code _}.
      */
     public void setOutputName(String name) {
         this.outputName = name;
@@ -99,14 +100,8 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
 
     // ── Nome de arquivo ───────────────────────────────────────────────────────
 
-    /**
-     * Constrói o nome base do arquivo:
-     * - se {@code outputName} foi definido → sanitiza e usa;
-     * - caso contrário → usa timestamp.
-     */
     private String buildBaseName() {
         if (outputName != null && !outputName.isBlank()) {
-            // Remove / substitui caracteres proibidos em nomes de arquivo
             return outputName.trim()
                     .replaceAll("[\\\\/:*?\"<>|]", "_")
                     .replaceAll("\\s+", " ");
@@ -127,10 +122,10 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
 
         try {
             OUTPUT_DIR.mkdirs();
-            File wavFile = new File(OUTPUT_DIR, baseName + ".wav");
 
-            // Se já existe um arquivo com mesmo nome, adiciona sufixo numérico
-            wavFile = resolveConflict(wavFile);
+            // Arquivo WAV temporário (prefixo "tmp_" para distinguir do produto final)
+            File wavFile = File.createTempFile("tmp_" + baseName + "_", ".wav", OUTPUT_DIR);
+            wavFile.deleteOnExit(); // garante limpeza mesmo em crash
 
             AudioInputStream ais = new AudioInputStream(
                     new ByteArrayInputStream(pcmData),
@@ -138,16 +133,31 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
                     pcmData.length / format.getFrameSize());
             AudioSystem.write(ais, AudioFileFormat.Type.WAVE, wavFile);
 
-            // Tenta converter para MP3 via LAME
-            File mp3File = new File(OUTPUT_DIR,
-                    wavFile.getName().replaceAll("\\.wav$", ".mp3"));
+            // ── Prioridade 1: Opus via FFmpeg ─────────────────────────────────
+            if (FFmpegDetector.isAvailable()) {
+                File opusFile = resolveConflict(new File(OUTPUT_DIR, baseName + ".opus"));
+                if (convertToOpus(wavFile, opusFile)) {
+                    wavFile.delete();
+                    outputFile = opusFile;
+                    fireSaved(outputFile);
+                    return;
+                }
+                System.err.println("[VoiceRecorder] Conversão Opus falhou, tentando MP3…");
+            }
+
+            // ── Prioridade 2: MP3 via LAME ────────────────────────────────────
+            File mp3File = resolveConflict(new File(OUTPUT_DIR, baseName + ".mp3"));
             if (convertToMp3(wavFile, mp3File)) {
                 wavFile.delete();
                 outputFile = mp3File;
-            } else {
-                outputFile = wavFile;
+                fireSaved(outputFile);
+                return;
             }
 
+            // ── Prioridade 3: WAV (fallback final) ────────────────────────────
+            File finalWav = resolveConflict(new File(OUTPUT_DIR, baseName + ".wav"));
+            wavFile.renameTo(finalWav);
+            outputFile = finalWav;
             fireSaved(outputFile);
 
         } catch (IOException e) {
@@ -155,21 +165,42 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
         }
     }
 
+    // ── Conversão Opus (FFmpeg) ───────────────────────────────────────────────
+
     /**
-     * Se o arquivo já existir, adiciona {@code (2)}, {@code (3)}, … ao nome.
+     * Converte {@code wav} para Opus usando FFmpeg.
+     * Só deve ser chamado após confirmar {@link FFmpegDetector#isAvailable()}.
+     *
+     * Parâmetros usados:
+     * <ul>
+     *   <li>{@code -c:a libopus} — codec Opus</li>
+     *   <li>{@code -b:a 128k}    — bitrate alvo (bom equilíbrio qualidade/tamanho)</li>
+     *   <li>{@code -vn}          — ignora streams de vídeo, se houver</li>
+     *   <li>{@code -y}           — sobrescreve destino sem perguntar</li>
+     * </ul>
      */
-    private File resolveConflict(File file) {
-        if (!file.exists()) return file;
-        String parent = file.getParent();
-        String name   = file.getName();
-        String base   = name.replaceAll("\\.wav$", "");
-        int    n      = 2;
-        File   candidate;
-        do {
-            candidate = new File(parent, base + " (" + n++ + ").wav");
-        } while (candidate.exists());
-        return candidate;
+    private boolean convertToOpus(File wav, File opus) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "ffmpeg",
+                    "-i",  wav.getAbsolutePath(),
+                    "-c:a", "libopus",
+                    "-b:a", "128k",
+                    "-vn",
+                    "-y",
+                    opus.getAbsolutePath());
+            pb.redirectErrorStream(true);
+            // Drena a saída para não travar o processo
+            Process p = pb.start();
+            p.getInputStream().transferTo(java.io.OutputStream.nullOutputStream());
+            return p.waitFor() == 0 && opus.exists() && opus.length() > 0;
+        } catch (Exception e) {
+            System.err.println("[VoiceRecorder] Erro ao converter para Opus: " + e.getMessage());
+            return false;
+        }
     }
+
+    // ── Conversão MP3 (LAME) ──────────────────────────────────────────────────
 
     private boolean convertToMp3(File wav, File mp3) {
         try {
@@ -188,11 +219,33 @@ public class VoiceRecorder implements SharedMicrophone.Consumer {
                 ? new String[]{"lame.exe", "lame"} : new String[]{"lame"};
         for (String name : names) {
             try {
-                new ProcessBuilder(name, "--version").redirectErrorStream(true).start().waitFor();
+                new ProcessBuilder(name, "--version")
+                        .redirectErrorStream(true).start().waitFor();
                 return name;
             } catch (Exception ignored) {}
         }
         return null;
+    }
+
+    // ── Resolução de conflito de nomes ────────────────────────────────────────
+
+    /**
+     * Se o arquivo já existir, adiciona {@code (2)}, {@code (3)}, …
+     * Funciona com qualquer extensão.
+     */
+    private File resolveConflict(File file) {
+        if (!file.exists()) return file;
+        String parent = file.getParent();
+        String name   = file.getName();
+        int    dot    = name.lastIndexOf('.');
+        String base   = dot >= 0 ? name.substring(0, dot)  : name;
+        String ext    = dot >= 0 ? name.substring(dot)     : "";   // inclui o "."
+        int    n      = 2;
+        File   candidate;
+        do {
+            candidate = new File(parent, base + " (" + n++ + ")" + ext);
+        } while (candidate.exists());
+        return candidate;
     }
 
     // ── Callbacks EDT ─────────────────────────────────────────────────────────

@@ -787,6 +787,10 @@ public class KaraokeApp extends JFrame {
                 copy, audioDetector, notePanel, timeScale, audioPlayer, offset,
                 voiceRecorder, sharedMic);
 
+        mode.setVoiceName(voiceName);
+        mode.setMusicName(musicName);
+
+
         currentMode = mode;
         mode.start();
 
