@@ -12,12 +12,21 @@ import java.util.List;
 /**
  * Painel lateral que exibe e gerencia a biblioteca de músicas.
  *
- * ── Mudanças em relação à versão MP3-only ────────────────────────────────────
- *  • SaveRequest.mp3File  → audioFile  (qualquer formato)
- *  • FFmpeg presente → converte para Opus antes de salvar
- *  • FFmpeg ausente  → exibe diálogo de instalação → salva áudio original
- *  • "Comprimir Biblioteca" virou "Converter para Opus" e pula quem já é .opus
- *  • Barra de progresso reutilizada para salvar e para conversão em lote
+ * ── Interações com a lista ───────────────────────────────────────────────────
+ *  2 cliques              → carrega a música
+ *  1 clique longo*        → inicia renomeação inline (via JOptionPane)
+ *  Del                    → exclui (com confirmação)
+ *  Botão direito          → menu suspenso: Carregar | Renomear | Deletar | Abrir Pasta
+ *
+ *  * "clique longo" = pressionar e soltar no mesmo item já selecionado,
+ *    com intervalo > 400 ms (threshold de duplo-clique do SO).
+ *
+ * ── Botões de rodapé ─────────────────────────────────────────────────────────
+ *  [Converter]  [Salvar]  — lado a lado na área de salvar.
+ *
+ * ── Fluxo FFmpeg ─────────────────────────────────────────────────────────────
+ *  Sempre que uma operação requer FFmpeg e ele não está disponível:
+ *  FFmpegDetector.ensureAvailable(parent) é chamado.
  */
 public class LibraryPanel extends JPanel {
 
@@ -29,7 +38,7 @@ public class LibraryPanel extends JPanel {
 
     public static class SaveRequest {
         public File   xmlFile;
-        public File   audioFile;       // qualquer formato: mp3, wav, flac, ogg…
+        public File   audioFile;
         public double realDurationMin;
         public double offsetSeconds;
         public int    selectedVoice;
@@ -46,9 +55,10 @@ public class LibraryPanel extends JPanel {
     private JButton saveBtn;
     private JButton convertAllBtn;
 
-    private final JButton loadBtn   = smallButton("📂 Carregar",  new Color(39, 174, 96));
-    private final JButton renameBtn = smallButton("✏ Renomear",  new Color(41, 128, 185));
-    private final JButton deleteBtn = smallButton("🗑 Deletar",   new Color(150, 40, 40));
+    // Controle do clique longo para renomear
+    private long   pressTime    = 0;
+    private int    pressIndex   = -1;
+    private static final long LONG_CLICK_MS = 600;
 
     // ── Construtor ────────────────────────────────────────────────────────────
     public LibraryPanel(Listener listener) {
@@ -64,7 +74,6 @@ public class LibraryPanel extends JPanel {
         add(buildCenter(),   BorderLayout.CENTER);
         add(buildSaveArea(), BorderLayout.SOUTH);
 
-        updateButtonStates();
         refresh();
     }
 
@@ -96,12 +105,69 @@ public class LibraryPanel extends JPanel {
         musicList.setBorder(new EmptyBorder(2, 4, 2, 4));
         musicList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
 
-        musicList.addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) updateButtonStates();
-        });
+        // Dica flutuante sobre atalhos
+        musicList.setToolTipText(
+                "<html>2 cliques ou ▶ Carregar → carrega<br>" +
+                        "Clique longo → renomear<br>" +
+                        "Del → deletar<br>" +
+                        "Botão direito → menu de opções</html>");
+
+        musicList.addListSelectionListener(e -> { /* estado gerenciado pelo menu */ });
+
+        // ── Mouse: duplo-clique carrega; clique longo renomeia; direito = menu ─
         musicList.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                if (e.getClickCount() == 2) loadSelected();
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                int idx = musicList.locationToIndex(e.getPoint());
+                if (idx < 0) return;
+
+                if (SwingUtilities.isRightMouseButton(e)) {
+                    musicList.setSelectedIndex(idx);
+                    showContextMenu(e.getComponent(), e.getX(), e.getY());
+                    return;
+                }
+
+                // Detecta clique longo apenas no item já selecionado
+                if (idx == musicList.getSelectedIndex()) {
+                    pressTime  = System.currentTimeMillis();
+                    pressIndex = idx;
+                } else {
+                    pressTime  = 0;
+                    pressIndex = -1;
+                }
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (SwingUtilities.isRightMouseButton(e)) return;
+
+                int idx = musicList.locationToIndex(e.getPoint());
+                if (idx < 0 || idx != pressIndex) { pressTime = 0; return; }
+
+                long elapsed = System.currentTimeMillis() - pressTime;
+                pressTime = 0;
+
+                if (elapsed >= LONG_CLICK_MS) {
+                    // Clique longo → renomear (só se não foi duplo-clique)
+                    renameSelected();
+                }
+            }
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2 && SwingUtilities.isLeftMouseButton(e)) {
+                    pressTime = 0; // cancela clique longo
+                    loadSelected();
+                }
+            }
+        });
+
+        // ── Teclado: Del deleta ───────────────────────────────────────────────
+        musicList.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_DELETE) deleteSelected();
             }
         });
 
@@ -109,50 +175,61 @@ public class LibraryPanel extends JPanel {
         scroll.setBorder(BorderFactory.createLineBorder(new Color(60, 60, 100)));
         scroll.getVerticalScrollBar().setUnitIncrement(16);
 
-        loadBtn.setToolTipText("Carrega a música selecionada");
-        loadBtn.addActionListener(e -> loadSelected());
-
-        renameBtn.setToolTipText("Renomeia a música selecionada");
-        renameBtn.addActionListener(e -> renameSelected());
-
-        deleteBtn.setToolTipText("Remove permanentemente a música da biblioteca");
-        deleteBtn.addActionListener(e -> deleteSelected());
-
-        JButton openFolderBtn = smallButton("📂 Abrir Pasta", new Color(100, 80, 20));
-        openFolderBtn.setToolTipText("Abre ~/KaraokeMusicas no explorador de arquivos");
-        openFolderBtn.addActionListener(e -> openLibraryFolder());
-
-        // Grade 2×2
-        JPanel btnGrid = new JPanel(new GridLayout(2, 2, 4, 3));
-        btnGrid.setBackground(new Color(18, 28, 52));
-        btnGrid.setBorder(new EmptyBorder(4, 0, 0, 0));
-        btnGrid.add(openFolderBtn);
-        btnGrid.add(loadBtn);
-        btnGrid.add(renameBtn);
-        btnGrid.add(deleteBtn);
-
-        // Tooltip dinâmico conforme FFmpeg disponível
-        boolean ffmpegOk = FFmpegDetector.isAvailable();
-        convertAllBtn = smallButton("🗜 Converter para Opus", new Color(80, 50, 120));
-        convertAllBtn.setToolTipText(ffmpegOk
-                ? "Converte todos os áudios da biblioteca para Opus 64 kbps (~70% menor)"
-                : "FFmpeg não encontrado — instale-o para habilitar esta opção");
-        convertAllBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
-        convertAllBtn.addActionListener(e -> convertAllToOpus());
-
-        JPanel btnPanel = new JPanel();
-        btnPanel.setLayout(new BoxLayout(btnPanel, BoxLayout.Y_AXIS));
-        btnPanel.setBackground(new Color(18, 28, 52));
-        btnPanel.add(btnGrid);
-        btnPanel.add(Box.createVerticalStrut(4));
-        btnPanel.add(convertAllBtn);
+        JLabel hint = new JLabel("ⓘ Duplo-clique: carregar  |  Del: deletar  |  ⌥ Dir: menu");
+        hint.setForeground(new Color(130, 140, 170));
+        hint.setFont(new Font("Arial", Font.ITALIC, 9));
+        hint.setBorder(new EmptyBorder(3, 2, 1, 2));
 
         JPanel center = new JPanel(new BorderLayout(0, 0));
         center.setBackground(new Color(18, 28, 52));
-        center.add(scroll,    BorderLayout.CENTER);
-        center.add(btnPanel,  BorderLayout.SOUTH);
+        center.add(scroll, BorderLayout.CENTER);
         return center;
     }
+
+    // ── Menu de contexto (botão direito) ──────────────────────────────────────
+
+    private void showContextMenu(Component comp, int x, int y) {
+        MusicLibrary.SavedMusic sel = musicList.getSelectedValue();
+        boolean hasSel = (sel != null);
+
+        JPopupMenu menu = new JPopupMenu();
+        menu.setBackground(new Color(30, 42, 70));
+
+        JMenuItem itemLoad = styledMenuItem("▶  Carregar",        new Color(39, 174, 96));
+        JMenuItem itemRename = styledMenuItem("✏  Renomear",      new Color(41, 128, 185));
+        JMenuItem itemDelete = styledMenuItem("🗑  Deletar",       new Color(180, 60, 60));
+        JMenuItem itemFolder = styledMenuItem("📂  Abrir Pasta",  new Color(180, 140, 40));
+
+        itemLoad.setEnabled(hasSel);
+        itemRename.setEnabled(hasSel);
+        itemDelete.setEnabled(hasSel);
+
+        itemLoad.addActionListener(e   -> loadSelected());
+        itemRename.addActionListener(e -> renameSelected());
+        itemDelete.addActionListener(e -> deleteSelected());
+        itemFolder.addActionListener(e -> openLibraryFolder());
+
+        menu.add(itemLoad);
+        menu.add(itemRename);
+        menu.addSeparator();
+        menu.add(itemDelete);
+        menu.addSeparator();
+        menu.add(itemFolder);
+
+        menu.show(comp, x, y);
+    }
+
+    private JMenuItem styledMenuItem(String text, Color fg) {
+        JMenuItem item = new JMenuItem(text);
+        item.setBackground(new Color(30, 42, 70));
+        item.setForeground(fg);
+        item.setFont(new Font("Arial", Font.BOLD, 12));
+        item.setBorderPainted(false);
+        item.setOpaque(true);
+        return item;
+    }
+
+    // ── Área de salvar (rodapé) ───────────────────────────────────────────────
 
     private JPanel buildSaveArea() {
         JPanel p = new JPanel();
@@ -182,18 +259,35 @@ public class LibraryPanel extends JPanel {
         p.add(nameField);
         p.add(Box.createVerticalStrut(5));
 
-        saveBtn = new JButton("💾 Salvar na Biblioteca");
+        // ── Linha com [Converter] [Salvar] lado a lado ────────────────────────
+        convertAllBtn = new JButton("🗜 Converter");
+        convertAllBtn.setBackground(new Color(80, 50, 120));
+        convertAllBtn.setForeground(Color.WHITE);
+        convertAllBtn.setFont(new Font("Arial", Font.BOLD, 11));
+        convertAllBtn.setFocusPainted(false);
+        convertAllBtn.setBorderPainted(false);
+        convertAllBtn.setToolTipText(
+                "Converte todos os áudios da biblioteca para Opus 64 kbps (~70% menor)");
+        convertAllBtn.addActionListener(e -> convertAllToOpus());
+
+        saveBtn = new JButton("💾 Salvar");
         saveBtn.setBackground(new Color(52, 73, 150));
         saveBtn.setForeground(Color.WHITE);
         saveBtn.setFont(new Font("Arial", Font.BOLD, 11));
         saveBtn.setFocusPainted(false);
         saveBtn.setBorderPainted(false);
-        saveBtn.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
-        saveBtn.setAlignmentX(LEFT_ALIGNMENT);
         saveBtn.addActionListener(e -> saveCurrentMusic());
-        p.add(saveBtn);
+
+        JPanel btnRow = new JPanel(new GridLayout(1, 2, 4, 0));
+        btnRow.setBackground(new Color(18, 28, 52));
+        btnRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        btnRow.setAlignmentX(LEFT_ALIGNMENT);
+        btnRow.add(convertAllBtn);
+        btnRow.add(saveBtn);
+        p.add(btnRow);
         p.add(Box.createVerticalStrut(4));
 
+        // ── Barra de progresso ────────────────────────────────────────────────
         conversionProgress.setMaximumSize(new Dimension(Integer.MAX_VALUE, 14));
         conversionProgress.setAlignmentX(LEFT_ALIGNMENT);
         conversionProgress.setStringPainted(true);
@@ -228,7 +322,6 @@ public class LibraryPanel extends JPanel {
             }
         }
         setStatus(all.isEmpty() ? "Nenhuma música salva." : all.size() + " música(s).");
-        updateButtonStates();
     }
 
     public void reloadList() { refresh(); }
@@ -288,10 +381,14 @@ public class LibraryPanel extends JPanel {
         MusicLibrary.SavedMusic m = musicList.getSelectedValue();
         if (m == null) { setStatus("⚠ Selecione uma música."); return; }
 
+        // Janela de confirmação estilizada
         int opt = JOptionPane.showConfirmDialog(this,
-                "Excluir permanentemente:\n\n  \"" + m.name +
-                        "\"\n\nEsta ação não pode ser desfeita.",
-                "Confirmar exclusão", JOptionPane.YES_NO_OPTION,
+                "<html><b>Excluir permanentemente:</b><br><br>" +
+                        "  🎵 \"" + m.name + "\"<br><br>" +
+                        "<small style='color:#cc4444'>⚠ Esta ação não pode ser desfeita.<br>" +
+                        "O arquivo de áudio e os dados serão removidos.</small></html>",
+                "Confirmar exclusão",
+                JOptionPane.YES_NO_OPTION,
                 JOptionPane.WARNING_MESSAGE);
         if (opt != JOptionPane.YES_OPTION) return;
 
@@ -330,14 +427,17 @@ public class LibraryPanel extends JPanel {
 
     // ── Conversão em lote → Opus ──────────────────────────────────────────────
 
-    /**
-     * Converte todos os áudios da biblioteca que ainda NÃO são Opus.
-     * Requer FFmpeg — exibe diálogo de instalação se ausente.
-     */
     private void convertAllToOpus() {
         if (!FFmpegDetector.isAvailable()) {
-            FFmpegDetector.showInstallDialog(this);
-            return;
+            boolean nowAvailable = FFmpegDetector.ensureAvailable(this);
+            if (!nowAvailable) {
+                JOptionPane.showMessageDialog(this,
+                        "<html><b>Conversão em lote não disponível.</b><br><br>" +
+                                "O FFmpeg é obrigatório para converter áudios para Opus.<br>" +
+                                "Instale o FFmpeg e tente novamente.</html>",
+                        "FFmpeg necessário", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
         }
 
         List<MusicLibrary.SavedMusic> all = MusicLibrary.listAll();
@@ -360,7 +460,6 @@ public class LibraryPanel extends JPanel {
                 JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (confirm != JOptionPane.YES_OPTION) return;
 
-        // [0]=processadas  [1]=erros  [2]=bytes economizados
         long[] stats = {0, 0, 0};
         setBulkConvertState(true);
 
@@ -384,23 +483,17 @@ public class LibraryPanel extends JPanel {
                     try {
                         tempOpus = AudioConverter.createTempOpus();
                         AudioConverter.convertToOpus(music.audioFile, tempOpus, null);
-
-                        // Re-salva na biblioteca usando o novo .opus
                         MusicLibrary.save(music.name, music.xmlFile, tempOpus,
                                 music.realDurationMin, music.offsetSeconds,
                                 music.selectedVoice);
 
-                        // Calcula espaço economizado a partir do arquivo já gravado
                         File savedOpus = new File(music.folder, "musica.opus");
                         if (savedOpus.exists())
                             stats[2] += originalSize - savedOpus.length();
-
                         stats[0]++;
-
                     } catch (Exception ex) {
                         stats[1]++;
-                        System.err.println("Erro ao converter \""
-                                + music.name + "\": " + ex.getMessage());
+                        System.err.println("Erro ao converter \"" + music.name + "\": " + ex.getMessage());
                     } finally {
                         if (tempOpus != null && tempOpus.exists()) tempOpus.delete();
                     }
@@ -427,8 +520,7 @@ public class LibraryPanel extends JPanel {
                         stats[1] > 0
                                 ? JOptionPane.WARNING_MESSAGE
                                 : JOptionPane.INFORMATION_MESSAGE);
-                setStatus(String.format("✓ %d convertidas · %.1f MB livres",
-                        stats[0], savedMb));
+                setStatus(String.format("✓ %d convertidas · %.1f MB livres", stats[0], savedMb));
                 refresh();
             }
         }.execute();
@@ -436,12 +528,6 @@ public class LibraryPanel extends JPanel {
 
     // ── Salvar música atual ───────────────────────────────────────────────────
 
-    /**
-     * Fluxo de salvamento:
-     *  1. Sem áudio              → salva só o XML
-     *  2. Com áudio + FFmpeg     → converte para Opus em background → salva .opus
-     *  3. Com áudio + sem FFmpeg → exibe aviso → salva áudio original
-     */
     private void saveCurrentMusic() {
         String name = nameField.getText().trim();
         if (name.isEmpty()) {
@@ -456,7 +542,6 @@ public class LibraryPanel extends JPanel {
             return;
         }
 
-        // Confirmação de sobrescrita
         boolean exists = MusicLibrary.listAll().stream()
                 .anyMatch(m -> m.name.equalsIgnoreCase(name));
         if (exists) {
@@ -466,21 +551,28 @@ public class LibraryPanel extends JPanel {
             if (opt != JOptionPane.YES_OPTION) return;
         }
 
-        // ── Sem áudio: salva direto ───────────────────────────────────────────
         if (req.audioFile == null) {
             executeSave(name, req, null);
             return;
         }
 
-        // ── Com áudio mas sem FFmpeg: avisa e salva original ─────────────────
         if (!FFmpegDetector.isAvailable()) {
-            FFmpegDetector.showInstallDialog(this);
-            setStatus("⚠ Salvo sem conversão (FFmpeg ausente).");
-            executeSave(name, req, req.audioFile);
-            return;
+            boolean nowAvailable = FFmpegDetector.ensureAvailable(this);
+            if (!nowAvailable) {
+                JOptionPane.showMessageDialog(this,
+                        "<html><b>⚠ Áudio salvo sem conversão.</b><br><br>" +
+                                "Sem o FFmpeg, não é possível converter para Opus.<br>" +
+                                "O áudio será salvo no formato original: <b>" +
+                                req.audioFile.getName() + "</b><br><br>" +
+                                "<small style='color:#888'>Para habilitar a conversão Opus,<br>" +
+                                "instale o FFmpeg e salve novamente.</small></html>",
+                        "Salvo sem conversão", JOptionPane.WARNING_MESSAGE);
+                setStatus("⚠ Salvo sem conversão (FFmpeg ausente).");
+                executeSave(name, req, req.audioFile);
+                return;
+            }
         }
 
-        // ── Com áudio e FFmpeg: converte para Opus em background ──────────────
         setSavingState(true);
         setStatus("⏳ Convertendo para Opus…");
 
@@ -518,7 +610,6 @@ public class LibraryPanel extends JPanel {
         }.execute();
     }
 
-    /** Persiste no disco via MusicLibrary. */
     private void executeSave(String name, SaveRequest req, File audioFile) {
         try {
             MusicLibrary.save(name,
@@ -539,11 +630,10 @@ public class LibraryPanel extends JPanel {
 
     // ── Helpers de estado de UI ───────────────────────────────────────────────
 
-    /** Bloqueia a UI durante o salvamento individual. */
     private void setSavingState(boolean saving) {
         saveBtn.setEnabled(!saving);
-        nameField.setEnabled(!saving);
         convertAllBtn.setEnabled(!saving);
+        nameField.setEnabled(!saving);
         conversionProgress.setMaximum(100);
         conversionProgress.setVisible(saving);
         if (saving) {
@@ -552,25 +642,14 @@ public class LibraryPanel extends JPanel {
         }
     }
 
-    /** Bloqueia a UI durante a conversão em lote. */
     private void setBulkConvertState(boolean converting) {
         convertAllBtn.setEnabled(!converting);
         saveBtn.setEnabled(!converting);
-        loadBtn.setEnabled(!converting);
-        renameBtn.setEnabled(!converting);
-        deleteBtn.setEnabled(!converting);
         conversionProgress.setVisible(converting);
         if (converting) {
             conversionProgress.setValue(0);
             conversionProgress.setString("Iniciando…");
         }
-    }
-
-    private void updateButtonStates() {
-        boolean hasSel = (musicList.getSelectedValue() != null);
-        loadBtn.setEnabled(hasSel);
-        renameBtn.setEnabled(hasSel);
-        deleteBtn.setEnabled(hasSel);
     }
 
     private void selectByName(String name) {
@@ -583,7 +662,6 @@ public class LibraryPanel extends JPanel {
         }
     }
 
-    /** Exibe status por 4 s e depois limpa. */
     private void setStatus(String msg) {
         statusLabel.setText(msg);
         new javax.swing.Timer(4000, e -> {
@@ -592,7 +670,6 @@ public class LibraryPanel extends JPanel {
         }).start();
     }
 
-    /** Status imediato sem timer (usado durante operações longas). */
     private void setStatusImmediate(String msg) {
         statusLabel.setText(msg);
     }

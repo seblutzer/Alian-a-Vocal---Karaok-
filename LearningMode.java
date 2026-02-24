@@ -12,6 +12,12 @@ import java.util.List;
 /**
  * Modo Aprendizado.
  *
+ * ── Integração com KaraokeApp ─────────────────────────────────────────────
+ *  Não abre mais uma JDialog separada. O KaraokeApp chama buildPanels() para
+ *  obter os painéis (lista de trechos e painel de controle) que são injetados
+ *  diretamente no layout da janela principal.
+ *  Ao sair do modo treino, KaraokeApp restaura o layout original.
+ *
  * ── Seleção múltipla ──────────────────────────────────────────────────────
  *  Shift+clique na lista seleciona um intervalo contíguo de trechos.
  *  Os trechos selecionados são mesclados em um "mega-segmento virtual" e
@@ -33,7 +39,7 @@ public class LearningMode {
     // ── Constantes ────────────────────────────────────────────────────────────
     private static final double GAP_THRESHOLD_S      = 0.05;
     private static final double LEAD_IN_S            = 2.0;
-    private static final double MIDI_LATENCY_S       = 0.50;
+    private static final double MIDI_LATENCY_S       = 0.30;
     private static final long   LOOP_INTERVAL_MS     = 20;
     private static final double PASS_PRECISION       = 80.0;
     private static final int    MIDI_CHANNEL         = 0;
@@ -46,11 +52,11 @@ public class LearningMode {
     private static final long   MP3_PLAY_SETTLE_MS   = 150;
 
     // ── Cores ─────────────────────────────────────────────────────────────────
-    private static final Color COLOR_PERFECT = new Color(255, 215,   0);
-    private static final Color COLOR_GREAT   = new Color( 50, 205,  50);
-    private static final Color COLOR_GOOD    = new Color(  0, 191, 255);
-    private static final Color COLOR_OK      = new Color(255, 165,   0);
-    private static final Color COLOR_MISSED  = new Color(220,  50,  60);
+    private static final Color COLOR_PERFECT = new Color(255, 215, 0);
+    private static final Color COLOR_GREAT   = new Color(52, 152, 219);
+    private static final Color COLOR_GOOD    = new Color(39, 174, 96);
+    private static final Color COLOR_OK      = new Color(116, 115, 115);
+    private static final Color COLOR_MISSED  = new Color(231, 76, 60);
 
     // ── Segmento ──────────────────────────────────────────────────────────────
     public static class Segment {
@@ -95,13 +101,9 @@ public class LearningMode {
     }
 
     // ── Mega-segmento (mescla de vários Segments contíguos) ───────────────────
-    /**
-     * Representa um intervalo contíguo de Segments tratados como um só.
-     * Usado quando o usuário seleciona mais de um trecho na lista.
-     */
     private static class MergedSegment {
-        final List<Segment>  sources;   // segmentos originais na ordem
-        final List<MusicNote> notes;    // notas unificadas (imutável)
+        final List<Segment>  sources;
+        final List<MusicNote> notes;
         final double startTime;
         final double endTime;
         final double playFrom;
@@ -147,14 +149,17 @@ public class LearningMode {
     private String voiceName = "Voz";
     private String musicName = "";
 
+    /** Callback chamado quando o usuário clica em "Sair do Treino". */
+    private Runnable onExitCallback;
+
     // ── MIDI ──────────────────────────────────────────────────────────────────
     private Synthesizer midiSynth;
     private MidiChannel midiChannel;
 
     // ── Estado ────────────────────────────────────────────────────────────────
     private List<Segment>      segments        = new ArrayList<>();
-    private int                currentSegIdx   = 0;       // índice do primeiro trecho selecionado
-    private MergedSegment      activeMerged    = null;    // segmento ativo (pode ser mesclado)
+    private int                currentSegIdx   = 0;
+    private MergedSegment      activeMerged    = null;
     private volatile boolean   running         = false;
     private volatile Phase     phase           = Phase.IDLE;
     private volatile int       loopToken       = 0;
@@ -165,17 +170,23 @@ public class LearningMode {
 
     private final Map<MusicNote, List<Double>> pitchSamples = new IdentityHashMap<>();
 
-    // ── UI ────────────────────────────────────────────────────────────────────
-    private JDialog                  dialog;
+    // ── UI – painéis públicos injetados no KaraokeApp ─────────────────────────
+    /** Lista de trechos – vai para o lado EAST (onde ficava a biblioteca). */
+    private JPanel segmentPanel;
+    /** Controles do modo treino – vai para o painel SOUTH (bottom). */
+    private JPanel learningControlPanel;
+    /** Painel de precisão – vai para o espaço do placar. */
+    private JPanel precisionPanel;
+
     private JList<String>            segmentList;
     private DefaultListModel<String> listModel;
     private JLabel                   phaseLabel, precisionLabel, segInfoLabel;
     private JProgressBar             progressBar;
-    private JButton                  listenBtn, singBtn, nextBtn, repeatBtn;
+    private JButton                  listenBtn, singBtn;
     private JLabel                   resultLabel;
     private JPanel                   resultPanel;
     private JComboBox<String>        octaveCombo;
-    private JLabel                   selectionHintLabel; // dica de Shift+clique
+    private JLabel                   selectionHintLabel;
 
     private JToggleButton recordSwitch;
     private JLabel        recIndicatorLabel;
@@ -210,8 +221,22 @@ public class LearningMode {
         this.musicName = (name != null && !name.isBlank()) ? name.trim() : "";
     }
 
+    /**
+     * Define o callback chamado quando o usuário clica em "Sair do Treino".
+     * O KaraokeApp usa isso para restaurar o layout original.
+     */
+    public void setOnExitCallback(Runnable callback) {
+        this.onExitCallback = callback;
+    }
+
     // ── Ciclo de vida ─────────────────────────────────────────────────────────
-    public void start() {
+    /**
+     * Inicializa MIDI, detecta segmentos e constrói os painéis.
+     * Os painéis ficam disponíveis via getSegmentPanel(),
+     * getLearningControlPanel() e getPrecisionPanel().
+     * Retorna false se não houver segmentos (nada foi carregado ainda).
+     */
+    public boolean start() {
         initMidi();
         applyTimeScale();
         detectSegments();
@@ -220,13 +245,13 @@ public class LearningMode {
             JOptionPane.showMessageDialog(null,
                     "Nenhum segmento detectado no XML.",
                     "Modo Aprendizado", JOptionPane.WARNING_MESSAGE);
-            return;
+            return false;
         }
 
         running = true;
         audioDetector.startListening();
-        buildDialog();
-        dialog.setVisible(true);
+        buildPanels();
+        return true;
     }
 
     public void stop() {
@@ -238,8 +263,15 @@ public class LearningMode {
         stopAllMidi();
         closeMidi();
         stopRecordingIfActive();
-        if (dialog != null) SwingUtilities.invokeLater(() -> dialog.dispose());
     }
+
+    // ── Painéis públicos ──────────────────────────────────────────────────────
+    /** Painel lateral com a lista de trechos (substitui a biblioteca). */
+    public JPanel getSegmentPanel()        { return segmentPanel; }
+    /** Painel inferior com os controles de treino (substitui os botões de modo). */
+    public JPanel getLearningControlPanel() { return learningControlPanel; }
+    /** Painel de precisão/progresso (substitui o placar). */
+    public JPanel getPrecisionPanel()      { return precisionPanel; }
 
     // ── Gravação ──────────────────────────────────────────────────────────────
     private void startRecordingForMerged(MergedSegment merged) {
@@ -247,7 +279,6 @@ public class LearningMode {
         if (!recordSwitch.isSelected()) return;
 
         String fileName = buildRecordingName(merged);
-
         voiceRecorder.setOutputName(fileName);
         sharedMic.addConsumer(voiceRecorder);
         voiceRecorder.start();
@@ -357,18 +388,12 @@ public class LearningMode {
                 segments.size(), syncOffset);
     }
 
-    // ── Construção do MergedSegment a partir da seleção atual ────────────────
-    /**
-     * Lê os índices selecionados no JList e monta um MergedSegment.
-     * Se apenas um índice estiver selecionado, ainda usa MergedSegment
-     * (simplifica o loop — um único código-path para 1 ou N trechos).
-     */
+    // ── MergedSegment a partir da seleção atual ───────────────────────────────
     private MergedSegment buildMergedFromSelection() {
         int[] selected = segmentList.getSelectedIndices();
         if (selected == null || selected.length == 0)
             selected = new int[]{currentSegIdx};
 
-        // Garante ordem crescente e contiguidade (a lista força isso via SINGLE_INTERVAL)
         List<Segment> sources = new ArrayList<>();
         for (int idx : selected) {
             if (idx >= 0 && idx < segments.size())
@@ -391,43 +416,40 @@ public class LearningMode {
         return shifted;
     }
 
-    // ── UI ────────────────────────────────────────────────────────────────────
-    private void buildDialog() {
-        dialog = new JDialog((Frame) null, "📚 Modo Aprendizado", true);
-        dialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
-        dialog.addWindowListener(new WindowAdapter() {
-            @Override public void windowClosing(WindowEvent e) { stop(); }
-        });
-        dialog.setSize(860, 560);
-        dialog.setLocationRelativeTo(null);
-        dialog.setLayout(new BorderLayout(6, 6));
-        dialog.getContentPane().setBackground(new Color(22, 33, 62));
+    // ── Construção dos painéis (sem JDialog) ─────────────────────────────────
+    private void buildPanels() {
+        buildSegmentPanel();
+        buildPrecisionPanel();
+        buildLearningControlPanel();
 
-        // ── Lista de segmentos ────────────────────────────────────────────────
-        JPanel leftPanel = new JPanel(new BorderLayout(4, 4));
-        leftPanel.setBackground(new Color(15, 25, 50));
-        leftPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 4));
-        leftPanel.setPreferredSize(new Dimension(230, 0));
+        setPhaseUI(Phase.IDLE);
+        loadFromSelection();
+    }
+
+    /** Painel lateral: lista de trechos (substitui LibraryPanel). */
+    private void buildSegmentPanel() {
+        segmentPanel = new JPanel(new BorderLayout(4, 4));
+        segmentPanel.setBackground(new Color(15, 25, 50));
+        segmentPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 4));
+        segmentPanel.setPreferredSize(new Dimension(230, 0));
 
         JLabel listTitle = new JLabel("🎵 Trechos (" + segments.size() + ")");
         listTitle.setForeground(new Color(255, 215, 0));
-        listTitle.setFont(new Font("Arial", Font.BOLD, 12));
+        listTitle.setFont(new Font("Segoe UI Symbol", Font.BOLD, 12));
 
-        // Dica de Shift+clique
-        selectionHintLabel = new JLabel("Shift+clique para selecionar intervalo");
+        selectionHintLabel = new JLabel("Shift+clique: selecionar intervalo");
         selectionHintLabel.setForeground(new Color(130, 160, 200));
-        selectionHintLabel.setFont(new Font("Arial", Font.ITALIC, 10));
+        selectionHintLabel.setFont(new Font("Segoe UI Symbol", Font.ITALIC, 10));
 
         JPanel listHeader = new JPanel(new BorderLayout(2, 2));
         listHeader.setBackground(new Color(15, 25, 50));
         listHeader.add(listTitle,          BorderLayout.NORTH);
         listHeader.add(selectionHintLabel, BorderLayout.SOUTH);
-        leftPanel.add(listHeader, BorderLayout.NORTH);
+        segmentPanel.add(listHeader, BorderLayout.NORTH);
 
         listModel = new DefaultListModel<>();
         for (Segment seg : segments) listModel.addElement(seg.label);
 
-        // SINGLE_INTERVAL_SELECTION permite Shift+clique para intervalos contíguos
         segmentList = new JList<>(listModel);
         segmentList.setSelectionMode(ListSelectionModel.SINGLE_INTERVAL_SELECTION);
         styleList(segmentList);
@@ -436,62 +458,69 @@ public class LearningMode {
 
         JScrollPane listScroll = new JScrollPane(segmentList);
         listScroll.setBorder(BorderFactory.createLineBorder(new Color(60, 80, 120)));
-        leftPanel.add(listScroll, BorderLayout.CENTER);
+        segmentPanel.add(listScroll, BorderLayout.CENTER);
 
         if (syncOffset != 0.0) {
             JLabel offLbl = new JLabel(String.format("  offset: %.2fs", syncOffset));
             offLbl.setForeground(new Color(180, 220, 180));
-            offLbl.setFont(new Font("Arial", Font.ITALIC, 10));
-            leftPanel.add(offLbl, BorderLayout.SOUTH);
+            offLbl.setFont(new Font("Segoe UI Symbol", Font.ITALIC, 10));
+            segmentPanel.add(offLbl, BorderLayout.SOUTH);
         }
+    }
 
-        // ── Painel direito ────────────────────────────────────────────────────
-        JPanel right = new JPanel();
-        right.setLayout(new BoxLayout(right, BoxLayout.Y_AXIS));
-        right.setBackground(new Color(22, 33, 62));
-        right.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+    /** Painel de precisão/progresso (substitui o placar de pontuação). */
+    private void buildPrecisionPanel() {
+        precisionPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 14, 6));
+        precisionPanel.setBackground(new Color(15, 52, 96));
+        precisionPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createRaisedBevelBorder(),
+                BorderFactory.createEmptyBorder(6, 10, 6, 10)));
 
-        segInfoLabel = styledLabel("Selecione um trecho para começar", 13, Font.BOLD);
+        JLabel title = new JLabel("📚 MODO TREINO");
+        title.setForeground(new Color(255, 215, 0));
+        title.setFont(new Font("Segoe UI Symbol", Font.BOLD, 14));
+        precisionPanel.add(title);
+
+        segInfoLabel = new JLabel("Selecione um trecho para começar");
         segInfoLabel.setForeground(new Color(200, 220, 255));
-        segInfoLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        right.add(segInfoLabel);
-        right.add(Box.createVerticalStrut(8));
+        segInfoLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 11));
+        precisionPanel.add(segInfoLabel);
 
-        phaseLabel = styledLabel("", 20, Font.BOLD);
+        phaseLabel = new JLabel("");
         phaseLabel.setForeground(new Color(255, 215, 0));
-        phaseLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        right.add(phaseLabel);
-        right.add(Box.createVerticalStrut(8));
+        phaseLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 13));
+        precisionPanel.add(phaseLabel);
+
+        precisionLabel = new JLabel("Precisão: —");
+        precisionLabel.setForeground(new Color(200, 200, 200));
+        precisionLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 13));
+        precisionPanel.add(precisionLabel);
 
         progressBar = new JProgressBar(0, 100);
         progressBar.setStringPainted(true);
         progressBar.setString("Aguardando...");
         progressBar.setBackground(new Color(30, 40, 70));
         progressBar.setForeground(new Color(52, 152, 219));
-        progressBar.setMaximumSize(new Dimension(Integer.MAX_VALUE, 26));
-        progressBar.setAlignmentX(Component.CENTER_ALIGNMENT);
-        right.add(progressBar);
-        right.add(Box.createVerticalStrut(8));
+        progressBar.setPreferredSize(new Dimension(200, 22));
+        precisionPanel.add(progressBar);
 
-        precisionLabel = styledLabel("Precisão: —", 18, Font.BOLD);
-        precisionLabel.setForeground(new Color(200, 200, 200));
-        precisionLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        right.add(precisionLabel);
-        right.add(Box.createVerticalStrut(10));
-
+        resultLabel = new JLabel("");
+        resultLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 11));
         resultPanel = new JPanel();
-        resultPanel.setBackground(new Color(22, 33, 62));
-        resultPanel.setLayout(new BoxLayout(resultPanel, BoxLayout.Y_AXIS));
-        resultPanel.setAlignmentX(Component.CENTER_ALIGNMENT);
-        resultLabel = styledLabel("", 14, Font.BOLD);
-        resultLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+        resultPanel.setBackground(new Color(15, 52, 96));
         resultPanel.add(resultLabel);
         resultPanel.setVisible(false);
-        right.add(resultPanel);
-        right.add(Box.createVerticalStrut(10));
+        precisionPanel.add(resultPanel);
+    }
 
-        // ── Seletor de oitava ─────────────────────────────────────────────────
-        JPanel octavePanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 0));
+    /** Painel inferior: controles de treino (substitui os botões de modo). */
+    private void buildLearningControlPanel() {
+        learningControlPanel = new JPanel();
+        learningControlPanel.setLayout(new BoxLayout(learningControlPanel, BoxLayout.Y_AXIS));
+        learningControlPanel.setBackground(new Color(22, 33, 62));
+
+        // ── Seletor de oitava
+        JPanel octavePanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 8, 4));
         octavePanel.setBackground(new Color(22, 33, 62));
         octavePanel.setAlignmentX(Component.CENTER_ALIGNMENT);
         JLabel octaveLbl = styledLabel("🎵 Oitava:", 12, Font.BOLD);
@@ -501,7 +530,7 @@ public class LearningMode {
         octaveCombo.setSelectedIndex(1);
         octaveCombo.setBackground(new Color(30, 40, 80));
         octaveCombo.setForeground(Color.WHITE);
-        octaveCombo.setFont(new Font("Arial", Font.PLAIN, 12));
+        octaveCombo.setFont(new Font("Segoe UI Symbol", Font.PLAIN, 12));
         octaveCombo.setFocusable(false);
         octaveCombo.addActionListener(e -> {
             octaveShift = OCTAVE_OPTIONS[octaveCombo.getSelectedIndex()];
@@ -510,28 +539,27 @@ public class LearningMode {
         });
         octavePanel.add(octaveLbl);
         octavePanel.add(octaveCombo);
-        right.add(octavePanel);
-        right.add(Box.createVerticalStrut(10));
 
-        // ── Botões de ação ────────────────────────────────────────────────────
-        JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 4));
+        // ── Botões de ação + switch de gravação
+        JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 6));
         btnPanel.setBackground(new Color(22, 33, 62));
         btnPanel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
-        listenBtn = bigButton("👂 Ouvir trecho",  new Color(52, 73, 94));
-        singBtn   = bigButton("🎤 Cantar!",        new Color(39, 174, 96));
-        repeatBtn = bigButton("🔁 Repetir",        new Color(180, 100, 0));
-        nextBtn   = bigButton("▶ Próximo trecho", new Color(52, 152, 219));
+        listenBtn = bigButton("👂 Ouvir trecho", new Color(52, 73, 94));
+        singBtn   = bigButton("🎤 Cantar!",       new Color(39, 174, 96));
+
+        JButton exitBtn = bigButton("⬅ Sair do Treino", new Color(150, 50, 50));
+        exitBtn.addActionListener(e -> {
+            stop();
+            if (onExitCallback != null) onExitCallback.run();
+        });
 
         listenBtn.addActionListener(e -> startListenPhase());
         singBtn.addActionListener(e   -> startSingPhase());
-        repeatBtn.addActionListener(e -> startListenPhase());
-        nextBtn.addActionListener(e   -> advanceSegment());
 
         btnPanel.add(listenBtn);
         btnPanel.add(singBtn);
-        btnPanel.add(repeatBtn);
-        btnPanel.add(nextBtn);
+        btnPanel.add(exitBtn);
 
         if (voiceRecorder != null && sharedMic != null) {
             JSeparator sep = new JSeparator(SwingConstants.VERTICAL);
@@ -544,26 +572,21 @@ public class LearningMode {
 
             recIndicatorLabel = new JLabel("  🔴 GRAVANDO");
             recIndicatorLabel.setForeground(new Color(255, 80, 80));
-            recIndicatorLabel.setFont(new Font("Arial", Font.BOLD, 12));
+            recIndicatorLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 12));
             recIndicatorLabel.setVisible(false);
             btnPanel.add(recIndicatorLabel);
         }
-
-        right.add(btnPanel);
-        right.add(Box.createVerticalGlue());
 
         JLabel hint = styledLabel(
                 "Dica: ouça o trecho (MIDI + MP3), depois cante tentando superar 80%.",
                 10, Font.ITALIC);
         hint.setForeground(new Color(130, 130, 160));
         hint.setAlignmentX(Component.CENTER_ALIGNMENT);
-        right.add(hint);
 
-        dialog.add(leftPanel, BorderLayout.WEST);
-        dialog.add(right,     BorderLayout.CENTER);
-
-        setPhaseUI(Phase.IDLE);
-        loadFromSelection();
+        learningControlPanel.add(octavePanel);
+        learningControlPanel.add(btnPanel);
+        learningControlPanel.add(hint);
+        learningControlPanel.add(Box.createVerticalStrut(4));
     }
 
     private JToggleButton buildRecordSwitch() {
@@ -588,7 +611,7 @@ public class LearningMode {
                 int knobY = trackY + (TRACK_H - KNOB_DIAM) / 2;
                 g2.setColor(isEnabled() ? Color.WHITE : Color.LIGHT_GRAY);
                 g2.fillOval(knobX, knobY, KNOB_DIAM, KNOB_DIAM);
-                g2.setFont(new Font("Arial", Font.BOLD, 11));
+                g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 11));
                 FontMetrics fm = g2.getFontMetrics();
                 g2.setColor(isEnabled()
                         ? (isSelected() ? new Color(255,130,130) : new Color(160,160,180))
@@ -620,15 +643,11 @@ public class LearningMode {
         });
     }
 
-    /**
-     * Lê a seleção atual do JList, monta o MergedSegment e atualiza a UI.
-     * Chamado tanto na inicialização quanto em cada mudança de seleção.
-     */
     private void loadFromSelection() {
         int[] selected = segmentList.getSelectedIndices();
         if (selected == null || selected.length == 0) return;
 
-        currentSegIdx = selected[0]; // âncora = primeiro selecionado
+        currentSegIdx = selected[0];
         MergedSegment merged = buildMergedFromSelection();
         activeMerged = merged;
 
@@ -639,16 +658,15 @@ public class LearningMode {
         canvas.setNotes(displayNotes(merged));
         canvas.updateTime(merged.startTime);
 
-        // Descrição na barra de info
         String infoText;
         if (merged.sources.size() == 1) {
             Segment seg = merged.sources.get(0);
-            infoText = String.format("Trecho %d / %d  —  %.1fs de notas  —  %s",
+            infoText = String.format("Trecho %d/%d — %.1fs — %s",
                     seg.index + 1, segments.size(), merged.notesDuration(), seg.label);
         } else {
             int first = merged.sources.get(0).index + 1;
             int last  = merged.sources.get(merged.sources.size() - 1).index + 1;
-            infoText = String.format("Trechos %d – %d / %d  —  %.1fs de notas",
+            infoText = String.format("Trechos %d–%d/%d — %.1fs",
                     first, last, segments.size(), merged.notesDuration());
         }
 
@@ -750,12 +768,10 @@ public class LearningMode {
                     ? expectedMp3Start : rawMp3Time;
             double noteTime = mp3Time - syncOffset;
 
-            // ── Atualiza esteira ──────────────────────────────────────────────
             final double _nt = noteTime;
             SwingUtilities.invokeLater(() -> canvas.updateTime(_nt));
 
             if (sing) {
-                // ── Fase CANTAR ───────────────────────────────────────────────
                 canvas.addTrailPoint(noteTime, audioDetector.getInstantFreq());
 
                 for (MusicNote note : merged.notes) {
@@ -770,7 +786,6 @@ public class LearningMode {
                     }
                 }
             } else {
-                // ── Fase OUVIR (MIDI) ─────────────────────────────────────────
                 double midiTime    = noteTime + MIDI_LATENCY_S;
                 int    desiredNote = -1;
                 for (MusicNote note : merged.notes) {
@@ -787,7 +802,6 @@ public class LearningMode {
                 }
             }
 
-            // ── Barra de progresso ────────────────────────────────────────────
             double segLength = merged.endTime - merged.startTime;
             double elapsed   = noteTime - merged.startTime;
             int    barPct    = (int) Math.max(0, Math.min(100, (elapsed / segLength) * 100));
@@ -810,7 +824,6 @@ public class LearningMode {
                 }
             });
 
-            // ── Fim do segmento ───────────────────────────────────────────────
             if (noteTime >= merged.endTime + 0.3) {
                 if (!sing && activeMidiNote != -1) midiNoteOff(activeMidiNote);
                 if (AudioPlayer != null) AudioPlayer.stop();
@@ -961,7 +974,7 @@ public class LearningMode {
         String emoji = precision >= 90 ? "🏆" : precision >= 80 ? "✅"
                 : precision >= 50 ? "👍" : "💪";
         resultLabel.setText(passed
-                ? String.format("%s %.1f%%%s — Excelente! Quer o próximo trecho?", emoji, precision, rangeInfo)
+                ? String.format("%s %.1f%%%s — Excelente!", emoji, precision, rangeInfo)
                 : String.format("%s %.1f%%%s — Continue praticando!", emoji, precision, rangeInfo));
         resultLabel.setForeground(colorForPrecision(precision));
         resultPanel.setVisible(true);
@@ -969,57 +982,23 @@ public class LearningMode {
         phaseLabel.setText(passed ? "✅ Trecho aprovado!" : "🔁 Tente novamente!");
         phaseLabel.setForeground(colorForPrecision(precision));
         setPhaseUI(Phase.RESULT);
-    }
 
-    // ── Navegação ─────────────────────────────────────────────────────────────
-    private void jumpToSegment(int idx) {
-        if (idx < 0 || idx >= segments.size()) return;
-        loopToken++;
-        stopAllMidi();
-        stopRecordingIfActive();
-        if (AudioPlayer != null) AudioPlayer.stop();
-
-        // Seleciona apenas o trecho destino (sem intervalo)
+        // ← ADICIONE ISTO:
         SwingUtilities.invokeLater(() -> {
-            for (ListSelectionListener l : segmentList.getListSelectionListeners())
-                segmentList.removeListSelectionListener(l);
-            segmentList.setSelectedIndex(idx);
-            segmentList.ensureIndexIsVisible(idx);
-            attachListListener();
-            loadFromSelection();
+            phase = Phase.IDLE;  // Restaura IDLE para permitir nova seleção imediatamente
         });
     }
 
-    private void advanceSegment() {
-        // "Próximo" avança para além do ÚLTIMO trecho selecionado
-        int lastSelected = activeMerged != null
-                ? activeMerged.sources.get(activeMerged.sources.size() - 1).index
-                : currentSegIdx;
-        int next = lastSelected + 1;
-        if (next >= segments.size()) {
-            JOptionPane.showMessageDialog(dialog,
-                    "🎉 Parabéns! Você treinou todos os trechos!",
-                    "Modo Aprendizado", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-        jumpToSegment(next);
-    }
 
     // ── Estado da UI ──────────────────────────────────────────────────────────
     private void setPhaseUI(Phase p) {
         phase = p;
-        boolean notLast = activeMerged == null
-                ? currentSegIdx < segments.size() - 1
-                : activeMerged.sources.get(activeMerged.sources.size() - 1).index
-                < segments.size() - 1;
         switch (p) {
             case IDLE -> {
                 listenBtn.setEnabled(true);
                 singBtn.setEnabled(true);
-                repeatBtn.setEnabled(false);
-                nextBtn.setEnabled(notLast);
                 octaveCombo.setEnabled(true);
-                segmentList.setEnabled(true);    // ← libera lista para nova seleção
+                segmentList.setEnabled(true);
                 if (recordSwitch != null) recordSwitch.setEnabled(true);
                 phaseLabel.setText("⬇ Escolha: Ouvir ou Cantar");
                 phaseLabel.setForeground(new Color(255, 215, 0));
@@ -1027,19 +1006,15 @@ public class LearningMode {
             case LISTENING, SINGING -> {
                 listenBtn.setEnabled(false);
                 singBtn.setEnabled(false);
-                repeatBtn.setEnabled(false);
-                nextBtn.setEnabled(false);
                 octaveCombo.setEnabled(false);
-                segmentList.setEnabled(false);   // ← bloqueia lista durante execução
+                segmentList.setEnabled(false);
                 if (recordSwitch != null) recordSwitch.setEnabled(false);
             }
             case RESULT -> {
                 listenBtn.setEnabled(true);
                 singBtn.setEnabled(true);
-                repeatBtn.setEnabled(true);
-                nextBtn.setEnabled(notLast);
                 octaveCombo.setEnabled(true);
-                segmentList.setEnabled(true);    // ← libera lista para nova seleção
+                segmentList.setEnabled(true);
                 if (recordSwitch != null) recordSwitch.setEnabled(true);
             }
         }
@@ -1063,7 +1038,7 @@ public class LearningMode {
     private JLabel styledLabel(String text, int size, int style) {
         JLabel lbl = new JLabel(text);
         lbl.setForeground(Color.WHITE);
-        lbl.setFont(new Font("Arial", style, size));
+        lbl.setFont(new Font("Segoe UI Symbol", style, size));
         return lbl;
     }
 
@@ -1071,10 +1046,10 @@ public class LearningMode {
         JButton btn = new JButton(text);
         btn.setBackground(bg);
         btn.setForeground(Color.WHITE);
-        btn.setFont(new Font("Arial", Font.BOLD, 12));
+        btn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 13));
         btn.setFocusPainted(false);
         btn.setBorderPainted(false);
-        btn.setPreferredSize(new Dimension(165, 38));
+        btn.setPreferredSize(new Dimension(170, 42));
         return btn;
     }
 

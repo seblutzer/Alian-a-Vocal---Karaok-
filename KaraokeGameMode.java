@@ -14,10 +14,10 @@ import java.util.function.Consumer;
 
 public class KaraokeGameMode {
 
-    public static final Color COLOR_PERFECT = new Color(255, 215,   0);
-    public static final Color COLOR_GREAT   = new Color( 50, 205,  50);
-    public static final Color COLOR_GOOD    = new Color(  0, 191, 255);
-    public static final Color COLOR_OK      = new Color(255, 165,   0);
+    public static final Color COLOR_PERFECT = new Color(255, 215, 0);
+    public static final Color COLOR_GREAT   = new Color(52, 152, 219);
+    public static final Color COLOR_GOOD    = new Color(39, 174, 96);
+    public static final Color COLOR_OK      = new Color(116, 115, 115);
     public static final Color COLOR_MISSED  = new Color(220,  50,  60);
 
     public static class ScoreData {
@@ -41,6 +41,9 @@ public class KaraokeGameMode {
     private final double              timeScale;
     private final AudioPlayer         AudioPlayer;
     private final double              noteOffset;
+    // ── Acompanhamento MIDI (vozes concorrentes) ──────────────────────────────
+    private final MidiAccompanimentPlayer accompanimentPlayer;  // null = desativado
+
 
     private volatile boolean isPlaying   = false;
     private volatile int     octaveShift = 0;
@@ -64,7 +67,10 @@ public class KaraokeGameMode {
 
     public KaraokeGameMode(List<MusicNote> notes, AudioDetector audioDetector,
                            NoteScrollPanel canvas, Consumer<ScoreData> scoreCallback,
-                           double timeScale, AudioPlayer AudioPlayer, double noteOffset) {
+                           double timeScale, AudioPlayer AudioPlayer, double noteOffset,
+                           List<List<MusicNote>> accompanimentVoices,
+                           boolean playAccompaniment,
+                           float voiceFactor) {
         this.notes         = notes;
         this.audioDetector = audioDetector;
         this.canvas        = canvas;
@@ -72,6 +78,15 @@ public class KaraokeGameMode {
         this.timeScale     = timeScale;
         this.AudioPlayer   = AudioPlayer;
         this.noteOffset    = noteOffset;
+
+        if (playAccompaniment
+                && accompanimentVoices != null
+                && !accompanimentVoices.isEmpty()) {
+            this.accompanimentPlayer =
+                    new MidiAccompanimentPlayer(accompanimentVoices, voiceFactor);
+        } else {
+            this.accompanimentPlayer = null;
+        }
     }
 
     public void setOctaveShift(int shift) { this.octaveShift = shift; }
@@ -143,9 +158,14 @@ public class KaraokeGameMode {
 
         audioDetector.startListening();
 
+        // ── Acompanhamento MIDI ───────────────────────────────────────────────
+        // As notas já chegam com timeScale aplicado (feito em KaraokeApp)
+        if (accompanimentPlayer != null) {
+            accompanimentPlayer.start();
+        }
+
         if (AudioPlayer != null && AudioPlayer.isLoaded()) {
             AudioPlayer.stop();
-            AudioPlayer.setVolume(1f);
             AudioPlayer.seek(0);
             AudioPlayer.play();
         }
@@ -156,6 +176,9 @@ public class KaraokeGameMode {
     }
 
     public void stop() {
+        // ── Sempre para o MIDI, independente do estado de isPlaying ──────────
+        if (accompanimentPlayer != null) accompanimentPlayer.stop();
+
         if (!isPlaying) return;
 
         isPlaying = false;
@@ -173,8 +196,15 @@ public class KaraokeGameMode {
     public void onMp3Finished() {
         if (!isPlaying) return;
 
+        // ← SINCRONIZE COM isPlaying PRIMEIRO
         isPlaying = false;
+
         audioDetector.stopListening();
+
+        // ── Para acompanhamento MIDI ──────────────────────────────────────────
+        if (accompanimentPlayer != null) {
+            accompanimentPlayer.stop();  // Força parada imediata
+        }
 
         for (MusicNote note : notes)
             if (!note.wasEvaluated) finalizeNoteEvaluation(note);
@@ -213,6 +243,11 @@ public class KaraokeGameMode {
             canvas.updateTime(currentTime);
             canvas.addTrailPoint(currentTime, audioDetector.getInstantFreq());
 
+            // ── Toca vozes concorrentes via MIDI ─────────────────────────────────
+            if (accompanimentPlayer != null) {
+                accompanimentPlayer.tick(currentTime);
+            }
+
             for (MusicNote note : notes) {
                 if (!note.wasEvaluated) {
                     if (note.startTime <= currentTime && currentTime <= note.endTime) {
@@ -232,6 +267,20 @@ public class KaraokeGameMode {
                 for (MusicNote note : notes)
                     if (!note.wasEvaluated) finalizeNoteEvaluation(note);
                 isPlaying = false;
+
+                // Para o MIDI ANTES de mostrar resultados
+                if (accompanimentPlayer != null) {
+                    accompanimentPlayer.stop();
+                }
+
+                // Para o detector de áudio
+                audioDetector.stopListening();
+
+                // Para o MP3
+                if (AudioPlayer != null) {
+                    AudioPlayer.stop();
+                }
+
                 showResults();
                 break;
             }
@@ -394,10 +443,11 @@ public class KaraokeGameMode {
         int    scoreMin   = (int) (d.totalScore / 60);
         double scoreSec   = d.totalScore % 60;
 
-        String emoji = d.precision >= 85 ? "🏆 EXCELENTE!"
-                : d.precision >= 65 ? "👍 BOM TRABALHO!"
-                : d.precision >= 40 ? "🎵 CONTINUE ASSIM!"
-                :                     "💪 VAMOS PRATICAR MAIS!";
+        String emoji = d.precision >= 95 ? "🏆 PERFEITO! NÍVEL MESTRE!"
+                : d.precision >= 85 ? "🎯 MUITO BOM!"
+                : d.precision >= 65 ? "👍 CONTINUE PRATICANDO!"
+                : d.precision >= 40 ? "🎵 QUE TAL ENSAIAR MAIS?"
+                :                     "💪 NÃO DESISTA!";
 
         String title    = isPartial ? "🎤 RESULTADO PARCIAL 🎤" : "🎤 RESULTADO FINAL 🎤";
         String durLabel = isPartial ? "🎵 Duração cantada            " : "🎵 Duração total da música   ";
@@ -405,10 +455,10 @@ public class KaraokeGameMode {
         String msg = String.format("""
                 %s
 
-                ⭐ Perfeito : %d
+                ★ Perfeito : %d
                 ✓  Ótimo    : %d
-                👍 Bom      : %d
-                ✅ OK       : %d
+                ↑ Bom      : %d
+                ± OK       : %d
                 ✗  Errou    : %d
                 ─────────────────────────────
                 Total de notas : %d%s

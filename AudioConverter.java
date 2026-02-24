@@ -2,6 +2,7 @@
 package com.karaoke;
 
 import java.io.*;
+import java.nio.file.Path;
 import java.util.function.Consumer;
 
 /**
@@ -19,10 +20,12 @@ import java.util.function.Consumer;
  *  • Suportado nativamente pelo FFmpeg (libopus)
  *  • Container: OGG (.opus) — universalmente suportado
  *
- * ── Estimativa de progresso ───────────────────────────────────────────────────
- *  FFmpeg não expõe % diretamente na saída padrão (apenas tempo decorrido).
- *  Solicitamos a duração total via ffprobe e calculamos a % com base no
- *  "time=HH:MM:SS.ss" que o FFmpeg escreve na stderr a cada frame processado.
+ * ── Sobre caminhos ────────────────────────────────────────────────────────────
+ *  NUNCA usa "ffmpeg" ou "ffprobe" como string literal.
+ *  Sempre consulta FFmpegDetector.getResolvedPath() para obter o caminho
+ *  absoluto já verificado — essencial no macOS onde /opt/homebrew/bin
+ *  não está no PATH do processo Java.
+ *  O ffprobe é derivado do mesmo diretório que o ffmpeg.
  */
 public class AudioConverter {
 
@@ -38,21 +41,21 @@ public class AudioConverter {
      * @param input            Arquivo de entrada (MP3, WAV, FLAC, AAC, OGG…)
      * @param output           Arquivo de saída — DEVE ter extensão .opus
      * @param progressCallback Recebe 0–100 durante a conversão; pode ser null
-     * @throws ConversionUnavailableException se FFmpeg não estiver no PATH
+     * @throws ConversionUnavailableException se FFmpeg não estiver disponível
      * @throws ConversionException            se a conversão falhar por outro motivo
      */
     public static void convertToOpus(File input, File output,
                                      Consumer<Integer> progressCallback)
             throws ConversionException {
 
-        requireFfmpeg();
+        String ffmpegPath = requireFfmpeg();
 
         // Obtém duração total para calcular progresso (0 = desconhecida)
         double totalSeconds = probeDuration(input);
 
         try {
             ProcessBuilder pb = new ProcessBuilder(
-                    "ffmpeg",
+                    ffmpegPath,
                     "-y",                                   // sobrescreve sem perguntar
                     "-i", input.getAbsolutePath(),
                     "-c:a", "libopus",                      // codec Opus
@@ -101,7 +104,7 @@ public class AudioConverter {
      * Cria um arquivo temporário com a extensão indicada.
      * O chamador é responsável por deletá-lo após o uso.
      *
-     * @param extension ex: ".opus", ".mp3"  (com ponto)
+     * @param extension ex: ".opus", ".mp3" (com ponto)
      */
     public static File createTempAudio(String extension) throws ConversionException {
         try {
@@ -117,6 +120,44 @@ public class AudioConverter {
         return createTempAudio(".opus");
     }
 
+    // ── Resolução de caminhos ─────────────────────────────────────────────────
+
+    /**
+     * Retorna o caminho absoluto do ffmpeg verificado pelo FFmpegDetector.
+     * Lança ConversionUnavailableException se não disponível.
+     */
+    private static String requireFfmpeg() throws ConversionUnavailableException {
+        String path = FFmpegDetector.getResolvedPath();
+        if (path == null) throw new ConversionUnavailableException();
+        return path;
+    }
+
+    /**
+     * Deriva o caminho do ffprobe a partir do caminho do ffmpeg.
+     *
+     * Exemplos:
+     *   /opt/homebrew/bin/ffmpeg  →  /opt/homebrew/bin/ffprobe   (macOS Apple Silicon)
+     *   /usr/local/bin/ffmpeg     →  /usr/local/bin/ffprobe       (macOS Intel / Linux)
+     *   C:\...\ffmpeg.exe         →  C:\...\ffprobe.exe           (Windows)
+     *   ffmpeg                    →  ffprobe                      (no PATH global)
+     *
+     * @return Caminho do ffprobe (absoluto ou "ffprobe" se ffmpeg está no PATH)
+     */
+    private static String resolveFfprobePath() {
+        String ffmpeg = FFmpegDetector.getResolvedPath();
+        if (ffmpeg == null) return "ffprobe";
+
+        // Se é só "ffmpeg" (no PATH), ffprobe também está no PATH
+        if (!ffmpeg.contains("/") && !ffmpeg.contains("\\")) return "ffprobe";
+
+        // Substitui o nome do binário mantendo o diretório
+        String ffprobe = ffmpeg
+                .replace("ffmpeg.exe", "ffprobe.exe")   // Windows
+                .replace("/ffmpeg",    "/ffprobe");      // Unix
+
+        return ffprobe;
+    }
+
     // ── Parsing de progresso ──────────────────────────────────────────────────
 
     /**
@@ -126,7 +167,6 @@ public class AudioConverter {
      * @return 0–100 se a linha contém tempo; -1 se não for linha de progresso
      */
     private static int parseProgress(String line, double totalSeconds) {
-        // FFmpeg escreve "time=HH:MM:SS.ss" nas linhas de progresso
         int idx = line.indexOf("time=");
         if (idx < 0) return -1;
 
@@ -152,7 +192,7 @@ public class AudioConverter {
     private static double probeDuration(File file) {
         try {
             ProcessBuilder pb = new ProcessBuilder(
-                    "ffprobe",
+                    resolveFfprobePath(),                   // ← caminho resolvido, nunca literal
                     "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
@@ -170,13 +210,6 @@ public class AudioConverter {
                 return Double.parseDouble(output.trim());
         } catch (Exception ignored) {}
         return 0.0;
-    }
-
-    // ── Guard de FFmpeg ───────────────────────────────────────────────────────
-
-    private static void requireFfmpeg() throws ConversionUnavailableException {
-        if (!FFmpegDetector.isAvailable())
-            throw new ConversionUnavailableException();
     }
 
     // ── Exceções ──────────────────────────────────────────────────────────────

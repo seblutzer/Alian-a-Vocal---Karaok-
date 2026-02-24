@@ -21,8 +21,9 @@ public class NoteScrollPanel extends JPanel {
     private static final Color GRID_LINE_COLOR  = new Color(42, 42, 62);
     private static final Color NOTE_LABEL_COLOR = new Color(136, 136, 136);
     private static final Color COLOR_PERFECT    = new Color(255, 215, 0);
-    private static final Color COLOR_GREAT      = new Color(39, 174, 96);
-    private static final Color COLOR_GOOD       = new Color(52, 152, 219);
+    private static final Color COLOR_GREAT      = new Color(52, 152, 219);
+    private static final Color COLOR_GOOD       = new Color(39, 174, 96);
+    private static final Color COLOR_OK         = new Color(116, 115, 115);
     private static final Color COLOR_MISSED     = new Color(231, 76, 60);
     private static final Color COLOR_FUTURE     = new Color(155, 89, 182);
 
@@ -107,7 +108,7 @@ public class NoteScrollPanel extends JPanel {
     }
 
     private void drawGrid(Graphics2D g2, int w, int h) {
-        g2.setFont(new Font("Arial", Font.PLAIN, 8));
+        g2.setFont(new Font("Segoe UI Symbol", Font.PLAIN, 8));
         for (int midi = minMidi; midi <= maxMidi; midi++) {
             int y = midiToY(midi, h);
             String name = NOTE_NAMES[midi % 12];
@@ -130,7 +131,7 @@ public class NoteScrollPanel extends JPanel {
 
     private void drawNotes(Graphics2D g2, int h) {
         double timeEnd = currentTime + WINDOW_TIME;
-        g2.setFont(new Font("Arial", Font.BOLD, 10));
+        g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 10));
 
         for (MusicNote note : notes) {
             if (note.endTime < currentTime - 2.0 || note.startTime > timeEnd) continue;
@@ -146,6 +147,7 @@ public class NoteScrollPanel extends JPanel {
                     case "Perfeito!" -> COLOR_PERFECT;
                     case "Ótimo"     -> COLOR_GREAT;
                     case "Bom"       -> COLOR_GOOD;
+                    case "OK"        -> COLOR_OK;
                     default          -> COLOR_MISSED;
                 };
             } else if (note.endTime < currentTime) {
@@ -168,15 +170,16 @@ public class NoteScrollPanel extends JPanel {
             g2.drawString(text, tx, y + 4);
 
             if (note.wasEvaluated && note.endTime < currentTime) {
-                g2.setFont(new Font("Arial", Font.BOLD, 14));
+                g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 14));
                 int iconX = xEnd + 30;
                 switch (note.rating) {
                     case "Perfeito!" -> { g2.setColor(COLOR_PERFECT); g2.drawString("★", iconX, y + 5); }
                     case "Ótimo"     -> { g2.setColor(COLOR_GREAT);   g2.drawString("✓", iconX, y + 5); }
                     case "Bom"       -> { g2.setColor(COLOR_GOOD);    g2.drawString("↑", iconX, y + 5); }
+                    case "OK"       ->  { g2.setColor(COLOR_OK);      g2.drawString("±", iconX, y + 5); }
                     default          -> { g2.setColor(COLOR_MISSED);  g2.drawString("✗", iconX, y + 5); }
                 }
-                g2.setFont(new Font("Arial", Font.BOLD, 10));
+                g2.setFont(new Font("Segoe UI Symbol", Font.BOLD, 10));
             }
         }
     }
