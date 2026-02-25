@@ -34,6 +34,9 @@ public class KaraokeApp extends JFrame {
     private JButton playPauseBtn;
     private RecordSwitch recordSwitch;
     private LibraryPanel libraryPanel;
+    private MidiAccompanimentPlayer.PlaybackMode currentPlaybackMode
+            = MidiAccompanimentPlayer.PlaybackMode.ALL_EXCEPT_SELECTED;
+    private JButton playbackModeBtn; // Novo botão para alternar modos
 
     // ── Referências para troca de layout no modo treino
     private JPanel centerPanel;   // painel central (BorderLayout)
@@ -336,6 +339,44 @@ public class KaraokeApp extends JFrame {
         repaint();
     }
 
+    private void cyclePlaybackMode() {
+        int voiceIdx = voiceCombo.getSelectedIndex();
+        String voiceName = "?";
+
+        if (voiceIdx >= 0 && voiceIdx < allVoices.size()) {
+            String raw = (String) voiceCombo.getSelectedItem();
+            voiceName = raw != null
+                    ? raw.split("\\(")[0].trim()
+                    : "Voz";
+        }
+
+        switch (currentPlaybackMode) {
+            case ALL_EXCEPT_SELECTED:
+                currentPlaybackMode = MidiAccompanimentPlayer.PlaybackMode.ONLY_SELECTED;
+                playbackModeBtn.setText("🎵 Só " + voiceName);
+                playbackModeBtn.setToolTipText("Tocando APENAS " + voiceName +
+                        " | Clique para tocar TODAS");
+                break;
+
+            case ONLY_SELECTED:
+                currentPlaybackMode = MidiAccompanimentPlayer.PlaybackMode.ALL_VOICES;
+                playbackModeBtn.setText("🎵 Todas");
+                playbackModeBtn.setToolTipText("Tocando TODAS as vozes incluindo " + voiceName +
+                        " | Clique para retornar ao padrão");
+                break;
+
+            case ALL_VOICES:
+                currentPlaybackMode = MidiAccompanimentPlayer.PlaybackMode.ALL_EXCEPT_SELECTED;
+                playbackModeBtn.setText("🎵 Sem " + voiceName);
+                playbackModeBtn.setToolTipText("Tocando todas EXCETO " + voiceName +
+                        " | Clique para tocar só " + voiceName);
+                break;
+        }
+
+        statusLabel.setText("🎵 Modo: " + currentPlaybackMode);
+    }
+
+
     // ────────────────────────────────────────────────────────────────────────
     // PAINEL CENTRAL - Placar + Notas + Biblioteca
     // ────────────────────────────────────────────────────────────────────────
@@ -522,7 +563,7 @@ public class KaraokeApp extends JFrame {
         voiceBalanceSlider.setToolTipText("<html>Vozes MIDI ↔ Playback de áudio</html>");
 
         java.util.Hashtable<Integer, JLabel> labelTable = new java.util.Hashtable<>();
-        String[] ticks = {"0V/100P", "50V/100P", "100V/100P", "100V/50P", "100V/0P"};
+        String[] ticks = {"Só PB", "50% Voz", "½ / ½", "50% PB", "Só Voz"};
         for (int i = 0; i <= 4; i++) {
             JLabel lbl = new JLabel(ticks[i]);
             lbl.setForeground(new Color(180, 210, 255));
@@ -532,9 +573,14 @@ public class KaraokeApp extends JFrame {
         voiceBalanceSlider.setLabelTable(labelTable);
         voiceBalanceSlider.setPaintLabels(true);
 
-        JLabel balanceLabel = createLabel("🎵 Vozes/Playback");
-        balanceLabel.setFont(new Font("Segoe UI Symbol", Font.BOLD, 10));
-        switchPanel.add(balanceLabel);
+        // Botão para alternar modo de PlaybackMode
+        playbackModeBtn = createButton("🎵 Sem ?", new Color(52, 73, 94));
+        playbackModeBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 10));
+        playbackModeBtn.setPreferredSize(new Dimension(150, 28));
+        playbackModeBtn.addActionListener(e -> cyclePlaybackMode());
+        playbackModeBtn.setToolTipText("Clique para alternar modo de acompanhamento");
+        switchPanel.add(playbackModeBtn);
+
         switchPanel.add(voiceBalanceSlider);
 
         panel.add(statusLabel);
@@ -631,8 +677,30 @@ public class KaraokeApp extends JFrame {
             notes = allVoices.get(idx);
             notePanel.setNotes(notes);
             updateSongName(musicName);
+
+            // Atualiza o label do botão de modo
+            String raw = (String) voiceCombo.getSelectedItem();
+            String voiceName = raw != null
+                    ? raw.split("\\(")[0].trim()
+                    : "Voz";
+
+            switch (currentPlaybackMode) {
+                case ALL_EXCEPT_SELECTED:
+                    playbackModeBtn.setText("🎵 Sem " + voiceName);
+                    playbackModeBtn.setToolTipText("Tocando todas EXCETO " + voiceName);
+                    break;
+                case ONLY_SELECTED:
+                    playbackModeBtn.setText("🎵 Só " + voiceName);
+                    playbackModeBtn.setToolTipText("Tocando APENAS " + voiceName);
+                    break;
+                case ALL_VOICES:
+                    playbackModeBtn.setText("🎵 Todas + " + voiceName);
+                    playbackModeBtn.setToolTipText("Tocando TODAS as vozes");
+                    break;
+            }
         }
     }
+
 
     private void loadAudio() {
         JFileChooser chooser = new JFileChooser();
@@ -832,8 +900,15 @@ public class KaraokeApp extends JFrame {
         List<List<MusicNote>> accompanimentVoices = new ArrayList<>();
 
         if (playAcc) {
+            // Agora coleta vozes baseado no PlaybackMode
             for (int i = 0; i < allVoices.size(); i++) {
-                if (i == selectedIdx) continue;
+                boolean shouldInclude = switch (currentPlaybackMode) {
+                    case ALL_EXCEPT_SELECTED -> i != selectedIdx;
+                    case ONLY_SELECTED -> i == selectedIdx;
+                    case ALL_VOICES -> true;
+                };
+
+                if (!shouldInclude) continue;
 
                 List<MusicNote> voiceCopy = new ArrayList<>();
                 for (MusicNote n : allVoices.get(i)) {
