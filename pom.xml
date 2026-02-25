@@ -24,23 +24,14 @@
             <version>1.0.1</version>
         </dependency>
 
-        <!-- JAVE2: FFmpeg embutido para recompressão de MP3 -->
-        <dependency>
-            <groupId>ws.schild</groupId>
-            <artifactId>jave-all-deps</artifactId>
-            <version>3.5.0</version>
-        </dependency>
-
         <!--
-            SLF4J NOP: silencia o aviso "Failed to load StaticLoggerBinder"
-            que o JAVE2 emite no console. Descarta todos os logs internos
-            do JAVE2 sem afetar o funcionamento.
+            REMOVIDO: jave-all-deps (JAVE2 com FFmpeg embutido para todas as plataformas)
+            O app agora detecta e usa o FFmpeg instalado no sistema via FFmpegDetector,
+            eliminando a necessidade dos ~30-35 MB de binários nativos embutidos.
+
+            REMOVIDO: slf4j-nop
+            Era necessário apenas para silenciar os logs internos do JAVE2.
         -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-nop</artifactId>
-            <version>1.7.36</version>
-        </dependency>
     </dependencies>
 
     <build>
