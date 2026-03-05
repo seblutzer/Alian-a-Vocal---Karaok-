@@ -7,6 +7,7 @@ import java.awt.event.*;
 import java.io.File;
 import java.util.*;
 import java.util.List;
+import com.formdev.flatlaf.FlatDarkLaf;
 
 public class KaraokeApp extends JFrame {
 
@@ -133,7 +134,8 @@ public class KaraokeApp extends JFrame {
         audioDetector.setSharedMicrophone(sharedMic);
 
         addWindowListener(new WindowAdapter() {
-            @Override public void windowClosing(WindowEvent e) {
+            @Override
+            public void windowClosing(WindowEvent e) {
                 stopCurrentMode();
                 audioPlayer.stop();
                 audioDetector.stopListening();
@@ -153,14 +155,17 @@ public class KaraokeApp extends JFrame {
 
     private void setupAudioListeners() {
         audioPlayer.setListener(new AudioPlayer.PlayerListener() {
-            @Override public void onFinished() {
+            @Override
+            public void onFinished() {
                 SwingUtilities.invokeLater(() -> {
                     updatePlayPauseButton();
                     if (currentMode instanceof KaraokeGameMode mode)
                         mode.onMp3Finished();
                 });
             }
-            @Override public void onError(String msg) {
+
+            @Override
+            public void onError(String msg) {
                 SwingUtilities.invokeLater(() ->
                         JOptionPane.showMessageDialog(KaraokeApp.this, msg,
                                 "Erro de Áudio", JOptionPane.ERROR_MESSAGE));
@@ -168,13 +173,16 @@ public class KaraokeApp extends JFrame {
         });
 
         voiceRecorder.setListener(new VoiceRecorder.Listener() {
-            @Override public void onSaved(File file) {
+            @Override
+            public void onSaved(File file) {
                 SwingUtilities.invokeLater(() -> {
                     recordSwitch.setEnabled(true);
                     statusLabel.setText("💾 Gravação salva: " + file.getName());
                 });
             }
-            @Override public void onError(String message) {
+
+            @Override
+            public void onError(String message) {
                 SwingUtilities.invokeLater(() -> {
                     recordSwitch.setEnabled(true);
                     recordSwitch.setSelected(false);
@@ -402,10 +410,13 @@ public class KaraokeApp extends JFrame {
 
         // ── Biblioteca
         libraryPanel = new LibraryPanel(new LibraryPanel.Listener() {
-            @Override public void onLoad(MusicLibrary.SavedMusic music) {
+            @Override
+            public void onLoad(MusicLibrary.SavedMusic music) {
                 applyLibraryMusic(music);
             }
-            @Override public LibraryPanel.SaveRequest onSaveRequested() {
+
+            @Override
+            public LibraryPanel.SaveRequest onSaveRequested() {
                 if (lastXmlFile == null) return null;
                 LibraryPanel.SaveRequest req = new LibraryPanel.SaveRequest();
                 req.xmlFile = lastXmlFile;
@@ -491,13 +502,27 @@ public class KaraokeApp extends JFrame {
 
         // Armazenar referência ao label para atualizar depois
         switch (index) {
-            case 0: perfectLabel = valueLabel; break;
-            case 1: greatLabel = valueLabel; break;
-            case 2: goodLabel = valueLabel; break;
-            case 3: okLabel = valueLabel; break;
-            case 4: missedLabel = valueLabel; break;
-            case 5: precisionLabel = valueLabel; break;
-            case 6: totalScoreLabel = valueLabel; break;
+            case 0:
+                perfectLabel = valueLabel;
+                break;
+            case 1:
+                greatLabel = valueLabel;
+                break;
+            case 2:
+                goodLabel = valueLabel;
+                break;
+            case 3:
+                okLabel = valueLabel;
+                break;
+            case 4:
+                missedLabel = valueLabel;
+                break;
+            case 5:
+                precisionLabel = valueLabel;
+                break;
+            case 6:
+                totalScoreLabel = valueLabel;
+                break;
         }
 
         return panel;
@@ -662,7 +687,7 @@ public class KaraokeApp extends JFrame {
 
             infoLabel.setText(String.format("✓ %d notas | %.1f min | %d vozes",
                     result.allNotes.size(), xmlDuration / 60, allVoices.size()));
-            durationField.setText(String.format("%.2f", xmlDuration / 60).replace(",", "."));
+            durationField.setText(String.format("%.4f", xmlDuration / 60).replace(",", "."));
             notePanel.setNotes(notes);
             statusLabel.setText("✓ XML carregado!");
         } catch (Exception ex) {
@@ -781,7 +806,9 @@ public class KaraokeApp extends JFrame {
     private double getOffset() {
         try {
             return Double.parseDouble(offsetField.getText().trim().replace(",", "."));
-        } catch (NumberFormatException e) { return 0.0; }
+        } catch (NumberFormatException e) {
+            return 0.0;
+        }
     }
 
     private void applyOffset() {
@@ -843,10 +870,10 @@ public class KaraokeApp extends JFrame {
 
         if (music.realDurationMin > 0) {
             realDuration = music.realDurationMin * 60.0;
-            durationField.setText(String.format("%.2f", music.realDurationMin).replace(",", "."));
+            durationField.setText(String.format("%.4f", music.realDurationMin).replace(",", "."));
         } else {
             realDuration = 0.0;
-            durationField.setText(String.format("%.2f", xmlDuration / 60).replace(",", "."));
+            durationField.setText(String.format("%.4f", xmlDuration / 60).replace(",", "."));
         }
 
         offsetField.setText(String.format("%.2f", music.offsetSeconds).replace(",", "."));
@@ -872,8 +899,9 @@ public class KaraokeApp extends JFrame {
         stopCurrentMode();
 
         if (!sharedMic.isRunning()) {
-            try { sharedMic.start(); }
-            catch (javax.sound.sampled.LineUnavailableException ex) {
+            try {
+                sharedMic.start();
+            } catch (javax.sound.sampled.LineUnavailableException ex) {
                 JOptionPane.showMessageDialog(this,
                         "Não foi possível abrir o microfone:\n" + ex.getMessage(),
                         "Erro de Áudio", JOptionPane.ERROR_MESSAGE);
@@ -963,8 +991,9 @@ public class KaraokeApp extends JFrame {
         stopCurrentMode();
 
         if (!sharedMic.isRunning()) {
-            try { sharedMic.start(); }
-            catch (javax.sound.sampled.LineUnavailableException ex) {
+            try {
+                sharedMic.start();
+            } catch (javax.sound.sampled.LineUnavailableException ex) {
                 JOptionPane.showMessageDialog(this,
                         "Erro de microfone:\n" + ex.getMessage(),
                         "Erro de Áudio", JOptionPane.ERROR_MESSAGE);
@@ -1021,7 +1050,9 @@ public class KaraokeApp extends JFrame {
         });
     }
 
-    /** Restaura o layout original da janela ao sair do modo treino. */
+    /**
+     * Restaura o layout original da janela ao sair do modo treino.
+     */
     private void exitLearningMode() {
         currentMode = null;
         audioDetector.stopListening();
@@ -1135,17 +1166,32 @@ public class KaraokeApp extends JFrame {
     }
 
     public static void main(String[] args) {
+        // 0. INICIALIZAR CONFIG DO GITHUB PRIMEIRO (antes de qualquer outra coisa)
         try {
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        } catch (Exception ignored) {}
+            GitHubConfigManager.reload(); // Força inicialização e cria arquivo se necessário
+            System.out.println("✓ GitHub configurado: " + GitHubConfigManager.getConfigPath());
+        } catch (Exception e) {
+            System.err.println("✗ Erro ao configurar GitHub: " + e.getMessage());
+            System.exit(1);
+        }
 
+        // 1. Aplicar tema PRIMEIRO (antes de criar qualquer componente)
+        try {
+            FlatDarkLaf.setup();
+        } catch (Exception e) {
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception ignored) {
+            }
+        }
+
+        // 2. Criar a UI na thread do Swing
         SwingUtilities.invokeLater(() -> {
             KaraokeApp app = new KaraokeApp();
             app.setVisible(true);
 
-            SwingUtilities.invokeLater(() ->
-                    FFmpegDetector.initInBackground(app)
-            );
+            // 3. Inicializar FFmpeg em background (sem bloquear UI)
+            FFmpegDetector.initInBackground(app);
         });
     }
 }
