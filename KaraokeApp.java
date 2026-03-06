@@ -48,6 +48,7 @@ public class KaraokeApp extends JFrame {
     // ── UI Avançadas (colapsadas por padrão)
     private JPanel advancedPanel;
     private JButton toggleAdvancedBtn;
+    private JButton loadXmlBtn;
     private JTextField durationField, offsetField;
     private JComboBox<String> gameOctaveCombo;
     private JSlider voiceBalanceSlider;
@@ -226,7 +227,7 @@ public class KaraokeApp extends JFrame {
         JPanel line1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
         line1.setBackground(new Color(22, 33, 62));
 
-        JButton loadXmlBtn = createButton("📁 XML", new Color(15, 52, 96));
+        loadXmlBtn = createButton("📁 XML", new Color(15, 52, 96));  // ← AQUI
         loadXmlBtn.addActionListener(e -> loadXml());
         line1.add(loadXmlBtn);
 
@@ -234,6 +235,17 @@ public class KaraokeApp extends JFrame {
         voiceCombo = new JComboBox<>();
         voiceCombo.setPreferredSize(new Dimension(180, 28));
         voiceCombo.addActionListener(e -> onVoiceChange());
+
+// ── NOVO: Listener para LearningMode ──
+        voiceCombo.addActionListener(e -> {
+            if (currentMode instanceof LearningMode) {
+                int idx = voiceCombo.getSelectedIndex();
+                if (idx >= 0 && idx < allVoices.size()) {
+                    notes = allVoices.get(idx);
+                    restartLearningModeIfActive();
+                }
+            }
+        });
         line1.add(voiceCombo);
 
         JButton loadAudioBtn = createButton("🎵 Áudio", new Color(52, 73, 94));
@@ -258,7 +270,7 @@ public class KaraokeApp extends JFrame {
         line1.add(infoLabel);
 
         // Avançado (colapsável)
-        toggleAdvancedBtn = createButton("⚙ Avançado", new Color(100, 80, 120));
+        toggleAdvancedBtn = createButton("⚙ Avançado ▼", new Color(100, 80, 120));
         toggleAdvancedBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 10));
         toggleAdvancedBtn.addActionListener(e -> toggleAdvancedPanel());
         line1.add(toggleAdvancedBtn);
@@ -284,12 +296,18 @@ public class KaraokeApp extends JFrame {
 
         JButton adjustBtn = createButton("✓ Ajustar", new Color(233, 69, 96));
         adjustBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 9));
-        adjustBtn.addActionListener(e -> adjustTime());
+        adjustBtn.addActionListener(e -> {
+            adjustTime();
+            restartLearningModeIfActive();  // ← ADICIONE ISTO
+        });
         panel.add(adjustBtn);
 
         JButton restoreDurBtn = createButton("↺ Restaurar", new Color(100, 60, 20));
         restoreDurBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 9));
-        restoreDurBtn.addActionListener(e -> restoreOriginalDuration());
+        restoreDurBtn.addActionListener(e -> {
+            restoreOriginalDuration();
+            restartLearningModeIfActive();  // ← ADICIONE ISTO
+        });
         panel.add(restoreDurBtn);
 
         panel.add(new JSeparator(SwingConstants.VERTICAL) {{
@@ -303,8 +321,12 @@ public class KaraokeApp extends JFrame {
 
         JButton applyOffsetBtn = createButton("✓ Aplicar", new Color(52, 73, 94));
         applyOffsetBtn.setFont(new Font("Segoe UI Symbol", Font.BOLD, 9));
-        applyOffsetBtn.addActionListener(e -> applyOffset());
+        applyOffsetBtn.addActionListener(e -> {
+            applyOffset();
+            restartLearningModeIfActive();  // ← ADICIONE ISTO
+        });
         panel.add(applyOffsetBtn);
+
 
         offsetPreviewLabel = createLabel("Sem ajuste");
         offsetPreviewLabel.setForeground(new Color(180, 220, 180));
@@ -966,6 +988,13 @@ public class KaraokeApp extends JFrame {
         recordSwitch.setEnabled(false);
         voiceBalanceSlider.setEnabled(false);
 
+        // ── ADICIONE ESTAS LINHAS ──
+        loadXmlBtn.setEnabled(false);
+        voiceCombo.setEnabled(false);
+        playbackModeBtn.setEnabled(false);
+        toggleAdvancedBtn.setEnabled(false);
+        advancedPanel.setEnabled(false);  // Desabilita recursivamente todos os filhos
+
         if (recordSwitch.isSelected()) {
             String rawVoice = voiceCombo.getSelectedIndex() >= 0
                     ? (String) voiceCombo.getSelectedItem() : "Voz";
@@ -1044,6 +1073,9 @@ public class KaraokeApp extends JFrame {
             remove(bottomPanel);
             add(mode.getLearningControlPanel(), BorderLayout.SOUTH);
 
+            // ── DESABILITE XML e PDF ──
+            loadXmlBtn.setEnabled(false);
+
             statusLabel.setText("📚 APRENDENDO!");
             revalidate();
             repaint();
@@ -1083,6 +1115,11 @@ public class KaraokeApp extends JFrame {
                 centerPanel.add(libraryPanel, BorderLayout.EAST);
             }
 
+            // ── REABILITE XML e PDF ──
+            loadXmlBtn.setEnabled(true);
+            toggleAdvancedBtn.setEnabled(true);
+            advancedPanel.setEnabled(true);
+
             recordSwitch.setEnabled(true);
             gameOctaveCombo.setEnabled(true);
             voiceBalanceSlider.setEnabled(true);
@@ -1093,10 +1130,27 @@ public class KaraokeApp extends JFrame {
         });
     }
 
+    /**
+     * Se estamos em LearningMode, para e reinicia com os dados atuais.
+     * Caso contrário, faz nada.
+     */
+    private void restartLearningModeIfActive() {
+        if (!(currentMode instanceof LearningMode)) return;
+
+        System.out.println("[KaraokeApp] Reiniciando LearningMode com dados atualizados...");
+
+        // Para o modo atual (isso chama exitLearningMode via callback)
+        stopCurrentMode();
+
+        // Pequeno delay para garantir limpeza
+        SwingUtilities.invokeLater(() -> {
+            // Reinicia o modo treino
+            startLearningMode();
+        });
+    }
+
     private void stopCurrentMode() {
         if (currentMode instanceof LearningMode m) {
-            // Para o LearningMode, o fluxo de limpeza de layout é feito em exitLearningMode.
-            // Se foi chamado pelo botão PARAR (não pelo botão interno), precisamos fazer o mesmo.
             m.stop();
             currentMode = null;
             exitLearningMode();
@@ -1109,6 +1163,16 @@ public class KaraokeApp extends JFrame {
         audioDetector.stopListening();
         audioPlayer.setVolume(1.0f);
 
+        // ── REABILITE OS COMPONENTES ──
+        loadXmlBtn.setEnabled(true);
+        voiceCombo.setEnabled(true);
+        playbackModeBtn.setEnabled(true);
+        toggleAdvancedBtn.setEnabled(true);
+        advancedPanel.setEnabled(true);
+        gameOctaveCombo.setEnabled(true);
+        voiceBalanceSlider.setEnabled(true);
+        // ────────────────────────────
+
         if (voiceRecorder.isRecording()) {
             voiceRecorder.stop();
             sharedMic.removeConsumer(voiceRecorder);
@@ -1119,7 +1183,6 @@ public class KaraokeApp extends JFrame {
         }
 
         sharedMic.stop();
-        gameOctaveCombo.setEnabled(true);
     }
 
     private void stopRecordingIfActive() {
@@ -1130,6 +1193,10 @@ public class KaraokeApp extends JFrame {
         if (recordSwitch != null) recordSwitch.setEnabled(true);
         if (gameOctaveCombo != null) gameOctaveCombo.setEnabled(true);
         if (voiceBalanceSlider != null) voiceBalanceSlider.setEnabled(true);
+        if (loadXmlBtn != null) loadXmlBtn.setEnabled(true);           // ← Adicione
+        if (voiceCombo != null) voiceCombo.setEnabled(true);           // ← Adicione
+        if (playbackModeBtn != null) playbackModeBtn.setEnabled(true); // ← Adicione
+        if (toggleAdvancedBtn != null) toggleAdvancedBtn.setEnabled(true); // ← Adicione
     }
 
     // ───────────────────────────────────────────────────────────────────────

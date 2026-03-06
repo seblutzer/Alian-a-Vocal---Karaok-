@@ -112,39 +112,25 @@ public class LibraryPanel extends JPanel {
             refreshBtn.setEnabled(false);
             refresh();
 
-            // Sincroniza com GitHub
-            GitHubSyncManager.syncWithGitHub(new GitHubSyncManager.SyncListener() {
-                @Override
-                public void onProgress(String message, int current, int total) {
-                    setStatus(message + (total > 0 ? " (" + current + "/" + total + ")" : ""));
-                }
+            // ✅ NOVO: Verificar se é primeira sincronização
+            new Thread(() -> {
+                try {
+                    // Tentar baixar manifest
+                    ManifestCreator.downloadManifest();
 
-                @Override
-                public void onError(String error) {
-                    setStatus("❌ " + error);
-                    refreshBtn.setEnabled(true);
-                }
+                    // ✅ Manifest existe - fazer sync normal
+                    SwingUtilities.invokeLater(() -> {
+                        syncWithGitHubNormal(refreshBtn);
+                    });
 
-                @Override
-                public void onComplete(int downloaded, int skipped, int upToDate) {
-                    refresh();
-                    String msg = "";
-                    if (downloaded > 0) {
-                        msg = "✓ " + downloaded + " música(s) sincronizada(s)";
-                    }
-                    if (skipped > 0) {
-                        msg += (msg.isEmpty() ? "" : " | ") + "⚠ " + skipped + " erro(s)";
-                    }
-                    if (upToDate > 0) {
-                        msg += (msg.isEmpty() ? "" : " | ") + "📋 " + upToDate + " já atualizada(s)";
-                    }
-                    if (downloaded == 0 && skipped == 0 && upToDate == 0) {
-                        msg = "✓ Biblioteca atualizada (nenhuma novidade)";
-                    }
-                    setStatus(msg);
-                    refreshBtn.setEnabled(true);
+                } catch (Exception ex) {
+                    // ✅ Manifest não existe - gerar completo (primeira vez)
+                    System.err.println("⚠️  Primeira sincronização detectada!");
+                    SwingUtilities.invokeLater(() -> {
+                        generateManifestAndSync(refreshBtn);
+                    });
                 }
-            });
+            }).start();
         });
         titleRow.add(refreshBtn, BorderLayout.EAST);
 
@@ -908,5 +894,146 @@ public class LibraryPanel extends JPanel {
 
     public MusicLibrary.SavedMusic getSelectedMusic() {
         return musicList.getSelectedValue();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+// ✅ NOVO: Métodos para sincronização com GitHub
+// ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * ✅ Sincronização normal (quando manifest já existe)
+     */
+    private void syncWithGitHubNormal(JButton refreshBtn) {
+        System.out.println("📡 Iniciando sincronização normal...\n");
+
+        GitHubSyncManager.syncWithGitHub(new GitHubSyncManager.SyncListener() {
+            @Override
+            public void onProgress(String message, int current, int total) {
+                SwingUtilities.invokeLater(() -> {
+                    setStatus(message + (total > 0 ? " (" + current + "/" + total + ")" : ""));
+                });
+            }
+
+            @Override
+            public void onError(String error) {
+                SwingUtilities.invokeLater(() -> {
+                    setStatus("❌ " + error);
+                    refreshBtn.setEnabled(true);
+                });
+            }
+
+            @Override
+            public void onComplete(int downloaded, int updated, int skipped) {
+                SwingUtilities.invokeLater(() -> {
+                    refresh();
+
+                    StringBuilder msg = new StringBuilder();
+                    if (downloaded > 0) {
+                        msg.append("✓ ").append(downloaded).append(" música(s) baixada(s)");
+                    }
+                    if (updated > 0) {
+                        if (msg.length() > 0) msg.append(" | ");
+                        msg.append("🔄 ").append(updated).append(" atualizada(s)");
+                    }
+                    if (skipped > 0) {
+                        if (msg.length() > 0) msg.append(" | ");
+                        msg.append("⚠ ").append(skipped).append(" erro(s)");
+                    }
+                    if (downloaded == 0 && updated == 0 && skipped == 0) {
+                        msg.append("✓ Biblioteca atualizada (nenhuma novidade)");
+                    }
+
+                    setStatus(msg.toString());
+                    refreshBtn.setEnabled(true);
+                });
+            }
+        });
+    }
+
+    /**
+     * ✅ Geração de manifest completo e sincronização (primeira vez)
+     */
+    private void generateManifestAndSync(JButton refreshBtn) {
+        System.out.println("🔄 Gerando manifest completo...\n");
+
+        // ✅ Mostrar dialog de progresso
+        JDialog progressDialog = createProgressDialog("Gerando Manifest",
+                "Escaneando todas as músicas no GitHub...");
+        progressDialog.setLocationRelativeTo(this.getParent());
+        progressDialog.setVisible(true);
+
+        ManifestCreator.generateCompleteManifestFromGitHub(new ManifestCreator.ManifestListener() {
+            @Override
+            public void onProgress(String message, int current, int total) {
+                SwingUtilities.invokeLater(() -> {
+                    setStatus(message);
+                    System.out.println(message);
+                });
+            }
+
+            @Override
+            public void onError(String error) {
+                SwingUtilities.invokeLater(() -> {
+                    progressDialog.dispose();
+                    setStatus("❌ Erro: " + error);
+                    refreshBtn.setEnabled(true);
+
+                    JOptionPane.showMessageDialog(LibraryPanel.this,
+                            "<html><b>Erro ao gerar manifest:</b><br><br>" +
+                                    error + "<br><br>" +
+                                    "<small>Tente novamente mais tarde.</small></html>",
+                            "Erro na Sincronização", JOptionPane.ERROR_MESSAGE);
+                });
+            }
+
+            @Override
+            public void onComplete(boolean success, int totalMusics) {
+                SwingUtilities.invokeLater(() -> {
+                    progressDialog.dispose();
+
+                    String completionMsg = String.format(
+                            "✅ Manifest criado com %d música(s)!\n\n" +
+                                    "Iniciando sincronização...",
+                            totalMusics);
+
+                    setStatus("✓ Manifest gerado com " + totalMusics + " música(s)");
+                    System.out.println(completionMsg);
+
+                    // ✅ Agora fazer sync normal
+                    syncWithGitHubNormal(refreshBtn);
+                });
+            }
+        });
+    }
+
+    /**
+     * ✅ Cria dialog de progresso simples
+     */
+    private JDialog createProgressDialog(String title, String message) {
+        JDialog dialog = new JDialog();
+        dialog.setTitle(title);
+        dialog.setDefaultCloseOperation(JDialog.DO_NOTHING_ON_CLOSE);
+        dialog.setSize(400, 120);
+        dialog.setResizable(false);
+        dialog.setModal(false);
+
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+        panel.setBackground(new Color(30, 42, 70));
+        panel.setBorder(new EmptyBorder(20, 20, 20, 20));
+
+        JLabel msgLabel = new JLabel(message);
+        msgLabel.setForeground(Color.WHITE);
+        msgLabel.setFont(new Font("Segoe UI Symbol", Font.PLAIN, 12));
+
+        JProgressBar progressBar = new JProgressBar();
+        progressBar.setIndeterminate(true);
+        progressBar.setBackground(new Color(30, 42, 70));
+        progressBar.setForeground(new Color(39, 174, 96));
+
+        panel.add(msgLabel, BorderLayout.NORTH);
+        panel.add(progressBar, BorderLayout.CENTER);
+
+        dialog.add(panel);
+        return dialog;
     }
 }

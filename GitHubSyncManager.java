@@ -7,119 +7,118 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
 import java.util.*;
 
 /**
- * Gerencia sincronização bidirecional de músicas com repositório GitHub.
- *
- * Sistema de versionamento:
- * - Armazena SHA do arquivo remoto no .properties
- * - Compara versões antes de baixar
- * - Verifica e atualiza arquivos existentes com base em:
- *   * .properties: offsetSeconds e realDurationMin
- *   * .xml: conteúdo completo
- *   * .opus/.audio: metadados (tamanho, duração, data modificação)
+ * Sistema de sincronização otimizado com GitHub usando manifest.json
  */
 public class GitHubSyncManager {
 
-    private static final String GITHUB_API_URL = GitHubConfigManager.getApiUrl();
-    private static final String REF = GitHubConfigManager.getRef();
+    private static final String MANIFEST_URL = "https://raw.githubusercontent.com/seblutzer/alianca_vocal_musics_files/refs/heads/main/sync-manifest.json";
     private static final long RATE_LIMIT_DELAY = GitHubConfigManager.getSyncRateLimit();
-    private static final String GITHUB_TOKEN = GitHubConfigManager.getToken();
 
-    private static final String PROP_CONFIG_VERSION = "github_config_version";
-    private static final String PROP_XML_VERSION = "github_xml_version";
-    private static final String PROP_AUDIO_VERSION = "github_audio_version";
+    private static final Set<String> SYNC_KEYS = new HashSet<>(Arrays.asList(
+            "offsetSeconds",
+            "realDurationMin"
+    ));
+
     private static final String PROP_LAST_SYNC = "last_sync_date";
-    private static final String PROP_OFFSET_SECONDS = "offsetSeconds";
-    private static final String PROP_REAL_DURATION_MIN = "realDurationMin";
-
 
     public interface SyncListener {
         void onProgress(String message, int current, int total);
         void onError(String error);
         void onComplete(int downloaded, int updated, int skipped);
     }
-    /**
-     * Inicia sincronização com GitHub (inclui verificação de arquivos existentes)
-     */
+
     public static void syncWithGitHub(SyncListener listener) {
         new Thread(() -> {
             try {
-                listener.onProgress("Conectando ao GitHub...", 0, 0);
+                listener.onProgress("📡 Baixando manifest...", 0, 0);
+                JSONObject manifest = downloadManifest();
 
-                // Fase 1: Encontrar e baixar novas músicas
-                List<MusicToDownload> toDownload = findNewMusics(listener);
-                int[] results = new int[]{0, 0, 0};
-
-                if (!toDownload.isEmpty()) {
-                    listener.onProgress("Baixando " + toDownload.size() + " música(s) nova(s)...", 0, toDownload.size());
-                    results = downloadMusics(toDownload, listener);
+                if (manifest == null) {
+                    throw new Exception("Falha ao baixar manifest.json");
                 }
 
-                // Fase 2: Verificar e atualizar arquivos existentes
-                listener.onProgress("Verificando arquivos existentes...", 0, 0);
-                int[] updateResults = verifyAndUpdateExistingMusics(listener);
+                int[] results = new int[]{0, 0, 0};
 
-                results[0] += updateResults[0]; // downloaded
-                results[1] += updateResults[1]; // updated
-                results[2] += updateResults[2]; // skipped
+                listener.onProgress("🔍 Verificando músicas locais...", 0, 0);
+                int[] verifyResults = verifyLocalMusicsAgainstManifest(manifest, listener);
+                results[0] += verifyResults[0];
+                results[1] += verifyResults[1];
+                results[2] += verifyResults[2];
+
+                List<MusicToDownload> toDownload = findNewMusics(manifest);
+                if (!toDownload.isEmpty()) {
+                    listener.onProgress("⬇️  Baixando " + toDownload.size() + " música(s)...", 0, toDownload.size());
+                    int[] downloadResults = downloadMusics(toDownload, manifest, listener);
+                    results[0] += downloadResults[0];
+                    results[1] += downloadResults[1];
+                    results[2] += downloadResults[2];
+                }
 
                 listener.onComplete(results[0], results[1], results[2]);
 
             } catch (Exception ex) {
-                listener.onError("Erro na sincronização: " + ex.getMessage());
+                listener.onError("❌ Erro: " + ex.getMessage());
                 ex.printStackTrace();
             }
         }).start();
     }
 
-    // ── Verificação de arquivos existentes ─────────────────────────────────
-
-    /**
-     * Verifica e atualiza todos os arquivos existentes localmente
-     */
-    private static int[] verifyAndUpdateExistingMusics(SyncListener listener) throws Exception {
-        int downloaded = 0;
+    private static int[] verifyLocalMusicsAgainstManifest(JSONObject manifest, SyncListener listener) throws Exception {
         int updated = 0;
         int skipped = 0;
 
-        List<MusicLibrary.SavedMusic> allLocal = MusicLibrary.listAll();
-        int total = allLocal.size();
+        List<MusicLibrary.SavedMusic> allLocal = getAllLocalMusics();
+        JSONObject musicsInManifest = manifest.optJSONObject("musics");
+
+        if (musicsInManifest == null) {
+            return new int[]{0, 0, allLocal.size()};
+        }
+
+        Map<String, JSONObject> manifestMap = new HashMap<>();
+        Iterator<String> keys = musicsInManifest.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            manifestMap.put(key, musicsInManifest.getJSONObject(key));
+        }
 
         for (int i = 0; i < allLocal.size(); i++) {
             MusicLibrary.SavedMusic music = allLocal.get(i);
-            String[] nameParts = music.name.split(" - ");
-
-            if (nameParts.length < 2) {
-                skipped++;
-                continue;
-            }
-
-            String musicName = nameParts[1].trim();
-            String authorName = music.author;
-
-            listener.onProgress("Verificando: " + authorName + " - " + musicName, i + 1, total);
+            listener.onProgress("🔍 Verificando: " + music.author + " - " + music.name, i + 1, allLocal.size());
 
             try {
-                Thread.sleep(RATE_LIMIT_DELAY);
-            } catch (InterruptedException ignored) {}
+                String localKey = generateMusicKey(music.author, music.name);
+
+                if (!manifestMap.containsKey(localKey)) {
+                    skipped++;
+                    continue;
+                }
+
+                JSONObject remoteData = manifestMap.get(localKey);
+                int result = verifyAndUpdateMusic(music, remoteData);
+
+                if (result == 1) {
+                    updated++;
+                }
+
+            } catch (Exception ex) {
+                skipped++;
+            }
         }
 
-        return new int[]{downloaded, updated, skipped};
+        return new int[]{0, updated, skipped};
     }
 
-    /**
-     * Verifica e atualiza uma música específica
-     * Retorna: 0 = sem mudanças, 1 = atualizado, 2 = arquivo baixado
-     */
-    private static int verifyAndUpdateMusic(String authorName, String musicName) throws Exception {
-        File musicFolder = getMusicFolder(authorName, musicName);
+    private static int verifyAndUpdateMusic(MusicLibrary.SavedMusic localMusic, JSONObject remoteData) throws Exception {
+        File musicFolder = getMusicFolder(localMusic.author, localMusic.name);
         if (!musicFolder.exists()) {
             return 0;
         }
 
-        String fileName = getFileName(authorName, musicName);
+        String fileName = getFileName(localMusic.author, localMusic.name);
         File configFile = new File(musicFolder, fileName + ".properties");
         File xmlFile = new File(musicFolder, fileName + ".xml");
         File audioFile = findAudioFileInFolder(musicFolder);
@@ -129,509 +128,213 @@ public class GitHubSyncManager {
         }
 
         Properties localProps = loadProperties(configFile);
+        String selectedVoice = localProps.getProperty("selectedVoice", "0");
+        boolean needsUpdate = false;
 
-        // ✅ NOVO: Procurar a URL usando o diretório local como pista
-        String musicUrl = findMusicUrlByLocalPath(musicFolder, authorName, musicName);
-        if (musicUrl == null) {
-            return 0;
-        }
+        // Verificar properties
+        if (remoteData.has("properties")) {
+            JSONObject remoteProps = remoteData.getJSONObject("properties");
 
-        Object response = getJsonResponse(musicUrl);
-        JSONArray files;
-        if (response instanceof JSONArray) {
-            files = (JSONArray) response;
-        } else if (response instanceof JSONObject) {
-            files = new JSONArray();
-            files.put((JSONObject) response);
-        } else {
-            return 0;
-        }
+            if (updatePropertyIfChanged(localProps, remoteProps, "offsetSeconds")) {
+                needsUpdate = true;
+            }
 
-        String xmlPath = null;
-        String configPath = null;
-        String audioPath = null;
-
-        for (int i = 0; i < files.length(); i++) {
-            JSONObject fileObj = files.getJSONObject(i);
-            if ("dir".equals(fileObj.optString("type"))) continue;
-
-            String remoteFileName = fileObj.getString("name");
-            String downloadUrl = fileObj.optString("download_url");
-
-            if (downloadUrl.isEmpty()) continue;
-
-            if (remoteFileName.endsWith(".xml")) {
-                xmlPath = downloadUrl;
-            } else if (remoteFileName.endsWith(".properties")) {
-                configPath = downloadUrl;
-            } else if (isAudioFile(remoteFileName)) {
-                audioPath = downloadUrl;
+            if (updatePropertyIfChanged(localProps, remoteProps, "realDurationMin")) {
+                needsUpdate = true;
             }
         }
 
-        if (configPath == null && musicUrl != null) {
-            configPath = musicUrl.replace("?ref=" + REF, "")
-                    .replace("?ref=main", "")
-                    + "/" + fileName + ".properties";
+        // Verificar XML
+        boolean needDownloadXml = false;
+        if (remoteData.has("xml") && xmlFile.exists()) {
+            JSONObject remoteXml = remoteData.getJSONObject("xml");
+            String remoteHash = remoteXml.optString("hash", "");
+            String localHash = calculateFileHash(xmlFile);
+
+            if (!remoteHash.isEmpty() && !remoteHash.equals(localHash)) {
+                needDownloadXml = true;
+                needsUpdate = true;
+            }
         }
 
-        boolean updated = false;
+        // Verificar áudio
+        boolean needDownloadAudio = false;
+        if (remoteData.has("audio") && audioFile != null) {
+            JSONObject remoteAudio = remoteData.getJSONObject("audio");
+            String remoteHash = remoteAudio.optString("hash", "");
+            String localHash = calculateFileHash(audioFile);
 
-        // ✅ 1. Verificar .properties
-        if (configPath != null) {
+            if (!remoteHash.isEmpty() && !remoteHash.equals(localHash)) {
+                needDownloadAudio = true;
+                needsUpdate = true;
+            }
+        }
+
+        if (needsUpdate) {
             try {
-                if (hasPropertiesChanged(configFile, configPath, localProps)) {
-                    downloadAndUpdateProperties(configPath, configFile);
-                    updated = true;
+                if (needDownloadXml) {
+                    String xmlUrl = buildMusicFileUrl(localMusic.author, localMusic.name, fileName + ".xml");
+                    downloadFile(xmlUrl, xmlFile);
                 }
+
+                if (needDownloadAudio) {
+                    String audioFormat = remoteData.getJSONObject("audio").optString("format", "opus");
+                    String audioUrl = buildMusicFileUrl(localMusic.author, localMusic.name, fileName + "." + audioFormat);
+                    downloadFile(audioUrl, audioFile);
+                }
+
+                localProps.setProperty("selectedVoice", selectedVoice);
+                localProps.setProperty(PROP_LAST_SYNC, getCurrentTimestamp());
+                saveProperties(configFile, localProps);
+
+                return 1;
+
             } catch (Exception ex) {
-                System.err.println("  ⚠️  Erro ao verificar properties: " + ex.getMessage());
+                throw ex;
             }
         }
 
-        // ✅ 2. Verificar .xml
-        if (xmlPath != null && xmlFile.exists()) {
-            try {
-                if (hasXmlChanged(xmlFile, xmlPath)) {
-                    downloadFile(fixDownloadUrl(xmlPath), xmlFile);
-                    updated = true;
-                }
-            } catch (Exception ex) {
-                System.err.println("  ⚠️  Erro ao verificar XML: " + ex.getMessage());
-            }
-        }
-
-        // ✅ 3. Verificar áudio
-        if (audioPath != null && audioFile != null) {
-            try {
-                if (hasAudioMetadataChanged(audioFile, audioPath)) {
-                    String ext = audioPath.substring(audioPath.lastIndexOf('.') + 1).toLowerCase();
-                    downloadFile(fixDownloadUrl(audioPath), audioFile);
-                    updated = true;
-                }
-            } catch (Exception ex) {
-                System.err.println("  ⚠️  Erro ao verificar áudio: " + ex.getMessage());
-            }
-        }
-
-        return updated ? 1 : 0;
+        return 0;
     }
 
-    /**
-     * Procura a URL da música no GitHub usando o caminho local como referência
-     * Isso é mais confiável que tentar reconstruir o autor
-     */
-    private static String findMusicUrlByLocalPath(File musicFolder, String authorName, String musicName) throws Exception {
-        // O caminho é: ...KaraokeMusicas/Aliança Vocal/{CoralName}/{MusicName}
-        // Vamos extrair o nome do coral do caminho local
-
-        File parentCoralFolder = musicFolder.getParentFile(); // Pasta do coral
-        if (parentCoralFolder == null) return null;
-
-        String localCoralName = parentCoralFolder.getName();
-        String localMusicName = musicFolder.getName();
-
-        try {
-            // Construir URL com encoding correto (%20 em vez de +)
-            String coralEncoded = URLEncoder.encode(localCoralName, StandardCharsets.UTF_8)
-                    .replace("+", "%20");
-            String coralPath = "Alian%C3%A7a%20Vocal/" + coralEncoded;
-            String coralUrl = buildGitHubApiUrl(coralPath);
-
-            JSONArray musics = getJsonArray(coralUrl);
-
-            Thread.sleep(RATE_LIMIT_DELAY);
-
-            for (int i = 0; i < musics.length(); i++) {
-                JSONObject musicObj = musics.getJSONObject(i);
-                String type = musicObj.optString("type");
-                String name = musicObj.optString("name");
-
-                if ("dir".equals(type) && localMusicName.equalsIgnoreCase(name)) {
-                    String url = musicObj.optString("url");
-                    return url;
-                }
-            }
-
-        } catch (Exception ex) {
-            System.err.println("  ❌ ERRO: " + ex.getMessage());
-        }
-
-        return null;
-    }
-
-    /**
-     * Verifica se os valores de offsetSeconds e realDurationMin mudaram no remoto
-     */
-    private static boolean hasPropertiesChanged(File localFile, String remotePath, Properties localProps) throws Exception {
-        // Baixar properties remotas
-        File tempFile = File.createTempFile("props", ".tmp");
-        downloadFile(fixDownloadUrl(remotePath), tempFile);
-        Properties remoteProps = loadProperties(tempFile);
-        tempFile.delete();
-
-        String localOffset = normalizeNumericProperty(localProps.getProperty(PROP_OFFSET_SECONDS, "0"));
-        String remoteOffset = normalizeNumericProperty(remoteProps.getProperty(PROP_OFFSET_SECONDS, "0"));
-
-        String localDuration = normalizeNumericProperty(localProps.getProperty(PROP_REAL_DURATION_MIN, "0"));
-        String remoteDuration = normalizeNumericProperty(remoteProps.getProperty(PROP_REAL_DURATION_MIN, "0"));
-
-        return !localOffset.equals(remoteOffset) || !localDuration.equals(remoteDuration);
-    }
-
-    /**
-     * Normaliza números (trata vírgula e ponto como separador decimal)
-     */
-    private static String normalizeNumericProperty(String value) {
-        try {
-            String normalized = value.trim().replace(",", ".");
-            return String.valueOf(Double.parseDouble(normalized));
-        } catch (NumberFormatException e) {
-            return "0";
-        }
-    }
-
-    /**
-     * Baixa e atualiza apenas os valores de offsetSeconds e realDurationMin
-     */
-    private static void downloadAndUpdateProperties(String remotePath, File localFile) throws Exception {
-        File tempFile = File.createTempFile("props", ".tmp");
-        downloadFile(fixDownloadUrl(remotePath), tempFile);
-        Properties remoteProps = loadProperties(tempFile);
-        tempFile.delete();
-
-        Properties localProps = loadProperties(localFile);
-
-        String remoteOffset = remoteProps.getProperty(PROP_OFFSET_SECONDS);
-        String remoteDuration = remoteProps.getProperty(PROP_REAL_DURATION_MIN);
-
-        if (remoteOffset != null) {
-            localProps.setProperty(PROP_OFFSET_SECONDS, remoteOffset);
-        }
-        if (remoteDuration != null) {
-            localProps.setProperty(PROP_REAL_DURATION_MIN, remoteDuration);
-        }
-
-        localProps.setProperty(PROP_LAST_SYNC, new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
-        saveProperties(localFile, localProps);
-    }
-
-    /**
-     * Compara conteúdo completo do XML
-     */
-    private static boolean hasXmlChanged(File localFile, String remotePath) throws Exception {
-        String localContent = new String(Files.readAllBytes(localFile.toPath()), StandardCharsets.UTF_8).trim();
-
-        File tempFile = File.createTempFile("xml", ".tmp");
-        downloadFile(fixDownloadUrl(remotePath), tempFile);
-        String remoteContent = new String(Files.readAllBytes(tempFile.toPath()), StandardCharsets.UTF_8).trim();
-        tempFile.delete();
-
-        return !localContent.equals(remoteContent);
-    }
-
-    /**
-     * Compara metadados do áudio (tamanho, data modificação, duração)
-     */
-    private static boolean hasAudioMetadataChanged(File localFile, String remotePath) throws Exception {
-        try {
-            long localSize = localFile.length();
-            long localLastModified = localFile.lastModified();
-
-            URL url = new URL(fixDownloadUrl(remotePath));
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("HEAD");
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(10000);
-            conn.setRequestProperty("User-Agent", "Java-GitHubSync/1.0");
-
-            if (GITHUB_TOKEN != null && !GITHUB_TOKEN.isEmpty()) {
-                conn.setRequestProperty("Authorization", "token " + GITHUB_TOKEN);
-            }
-
-            int responseCode = conn.getResponseCode();
-            if (responseCode != 200) {
-                conn.disconnect();
-                return false;
-            }
-
-            long remoteSize = conn.getContentLengthLong();
-            String lastModifiedHeader = conn.getHeaderField("Last-Modified");
-            conn.disconnect();
-
-            // Se tamanho mudou, arquivo mudou
-            if (localSize != remoteSize) {
-                return true;
-            }
-
-            // Comparar data modificação se disponível
-            if (lastModifiedHeader != null) {
-                // Parsear data HTTP e comparar com local
-                // Para simplificar, apenas comparamos tamanho
-                return false;
-            }
-
-            return false;
-
-        } catch (Exception ex) {
-            System.err.println("Erro ao verificar metadados: " + ex.getMessage());
+    private static boolean updatePropertyIfChanged(Properties localProps, JSONObject remoteProps, String key) {
+        if (!remoteProps.has(key)) {
             return false;
         }
+
+        String remoteValue = remoteProps.getString(key);
+        String localValue = localProps.getProperty(key, "0");
+
+        if (!normalizeNumeric(remoteValue).equals(normalizeNumeric(localValue))) {
+            localProps.setProperty(key, remoteValue);
+            return true;
+        }
+
+        return false;
     }
 
-    /**
-     * Procura a URL de uma música no GitHub
-     */
-    private static String findMusicUrlOnGitHub(String authorName, String musicName) throws Exception {
+    private static JSONObject downloadManifest() throws Exception {
+        File cacheFile = new File(System.getProperty("user.home"), ".karaoke_manifest_cache.json");
+
         try {
-            String coralPath = "Alian%C3%A7a%20Vocal/" + URLEncoder.encode(safeName(authorName), StandardCharsets.UTF_8);
-            String coralUrl = buildGitHubApiUrl(coralPath);
-            JSONArray musics = getJsonArray(coralUrl);
-
-            Thread.sleep(RATE_LIMIT_DELAY);
-
-            for (int i = 0; i < musics.length(); i++) {
-                JSONObject musicObj = musics.getJSONObject(i);
-                if ("dir".equals(musicObj.optString("type"))) {
-                    if (musicName.equals(musicObj.optString("name"))) {
-                        return musicObj.optString("url");
-                    }
-                }
+            String content = downloadTextFile(MANIFEST_URL);
+            JSONObject manifest = new JSONObject(content);
+            Files.write(cacheFile.toPath(), content.getBytes(StandardCharsets.UTF_8));
+            return manifest;
+        } catch (Exception ex) {
+            if (cacheFile.exists()) {
+                String cached = new String(Files.readAllBytes(cacheFile.toPath()), StandardCharsets.UTF_8);
+                return new JSONObject(cached);
             }
-        } catch (Exception ignored) {}
-        return null;
+            throw ex;
+        }
     }
 
-    // ── Métodos existentes (mantidos) ────────────────────────────────────────
-
-    private static List<MusicToDownload> findNewMusics(SyncListener listener) throws Exception {
+    private static List<MusicToDownload> findNewMusics(JSONObject manifest) throws Exception {
         List<MusicToDownload> toDownload = new ArrayList<>();
-        Set<String> localMusics = getLocalMusics();
+        Set<String> localKeys = new HashSet<>();
 
-        String aliancaUrl = buildGitHubApiUrl("Alian%C3%A7a%20Vocal");
-        JSONArray corals = getJsonArray(aliancaUrl);
+        for (MusicLibrary.SavedMusic m : getAllLocalMusics()) {
+            localKeys.add(generateMusicKey(m.author, m.name));
+        }
 
-        Thread.sleep(RATE_LIMIT_DELAY);
+        JSONObject musics = manifest.optJSONObject("musics");
+        if (musics == null) {
+            return toDownload;
+        }
 
-        for (int i = 0; i < corals.length(); i++) {
-            JSONObject coralObj = corals.getJSONObject(i);
-
-            if (!"dir".equals(coralObj.optString("type"))) {
-                continue;
-            }
-
-            String coralName = coralObj.getString("name");
-            String coralUrl = coralObj.optString("url");
-
-            try {
-                JSONArray musics = getJsonArray(coralUrl);
-                Thread.sleep(RATE_LIMIT_DELAY);
-
-                for (int j = 0; j < musics.length(); j++) {
-                    JSONObject musicObj = musics.getJSONObject(j);
-
-                    if (!"dir".equals(musicObj.optString("type"))) {
-                        continue;
-                    }
-
-                    String musicName = musicObj.getString("name");
-                    String musicUrl = musicObj.optString("url");
-
-                    String musicKey = coralName + "|" + musicName;
-                    if (!localMusics.contains(musicKey)) {
-                        toDownload.add(new MusicToDownload(coralName, musicName, musicUrl));
-                    }
-                }
-            } catch (Exception ex) {
-                System.err.println("Erro ao listar músicas de " + coralName + ": " + ex.getMessage());
+        Iterator<String> keys = musics.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            if (!localKeys.contains(key)) {
+                JSONObject musicData = musics.getJSONObject(key);
+                String author = musicData.getString("author");
+                String musicName = musicData.getString("musicName");
+                toDownload.add(new MusicToDownload(author, musicName, null));
             }
         }
 
         return toDownload;
     }
 
-    private static Set<String> getLocalMusics() {
-        Set<String> local = new HashSet<>();
-        List<MusicLibrary.SavedMusic> all = MusicLibrary.listAll();
-        for (MusicLibrary.SavedMusic m : all) {
-            String[] parts = m.name.split(" - ");
-            if (parts.length >= 2) {
-                local.add(m.author + "|" + parts[1].trim());
-            }
-        }
-        return local;
-    }
-
-    private static int[] downloadMusics(List<MusicToDownload> toDownload, SyncListener listener) {
+    private static int[] downloadMusics(List<MusicToDownload> toDownload, JSONObject manifest, SyncListener listener) {
         int downloaded = 0;
-        int updated = 0;
         int skipped = 0;
+
+        JSONObject musicsObj = manifest.optJSONObject("musics");
+        if (musicsObj == null) {
+            return new int[]{0, 0, 0};
+        }
 
         for (int i = 0; i < toDownload.size(); i++) {
             MusicToDownload music = toDownload.get(i);
-            listener.onProgress("Verificando: " + music.authorName + " - " + music.musicName,
+            listener.onProgress("⬇️  Baixando: " + music.authorName + " - " + music.musicName,
                     i + 1, toDownload.size());
 
             try {
-                int result = downloadMusic(music);
-                if (result == 0) {
+                String key = generateMusicKey(music.authorName, music.musicName);
+                JSONObject musicData = musicsObj.optJSONObject(key);
+
+                if (musicData != null) {
+                    downloadSingleMusic(music, musicData);
                     downloaded++;
-                } else if (result == 1) {
-                    updated++;
                 } else {
-                    // result == 2: já estava atualizado
+                    skipped++;
                 }
+
             } catch (Exception ex) {
-                System.err.println("Erro ao baixar " + music.musicName + ": " + ex.getMessage());
                 skipped++;
             }
 
             try {
-                Thread.sleep(RATE_LIMIT_DELAY * 2);
+                Thread.sleep(RATE_LIMIT_DELAY);
             } catch (InterruptedException ignored) {}
         }
 
-        return new int[]{downloaded, updated, skipped};
+        return new int[]{downloaded, 0, skipped};
     }
 
-    private static String buildGitHubApiUrl(String path) {
-        return GITHUB_API_URL + "/" + path;
-    }
-
-    private static int downloadMusic(MusicToDownload music) throws Exception {
-        Object response = getJsonResponse(music.musicUrl);
-
-        JSONArray files;
-        if (response instanceof JSONArray) {
-            files = (JSONArray) response;
-        } else if (response instanceof JSONObject) {
-            files = new JSONArray();
-            files.put((JSONObject) response);
-        } else {
-            throw new Exception("Resposta inesperada do GitHub para " + music.musicName);
-        }
-
+    private static void downloadSingleMusic(MusicToDownload music, JSONObject manifestData) throws Exception {
         File musicFolder = getMusicFolder(music.authorName, music.musicName);
         musicFolder.mkdirs();
 
-        File configFile = new File(musicFolder, getFileName(music) + ".properties");
-        Properties localProps = loadProperties(configFile);
+        String fileName = getFileName(music.authorName, music.musicName);
+        File configFile = new File(musicFolder, fileName + ".properties");
 
-        String xmlPath = null;
-        String xmlSha = null;
-        String audioPath = null;
-        String audioSha = null;
-        String configPath = null;
-        String configSha = null;
+        downloadFile(buildMusicFileUrl(music.authorName, music.musicName, fileName + ".xml"),
+                new File(musicFolder, fileName + ".xml"));
 
-        for (int i = 0; i < files.length(); i++) {
-            JSONObject fileObj = files.getJSONObject(i);
+        String audioFormat = manifestData.optJSONObject("audio").optString("format", "opus");
+        downloadFile(buildMusicFileUrl(music.authorName, music.musicName, fileName + "." + audioFormat),
+                new File(musicFolder, fileName + "." + audioFormat));
 
-            if ("dir".equals(fileObj.optString("type"))) {
-                continue;
-            }
+        Properties props = new Properties();
+        JSONObject remoteProps = manifestData.optJSONObject("properties");
+        if (remoteProps != null) {
+            props.setProperty("offsetSeconds", remoteProps.optString("offsetSeconds", "0"));
+            props.setProperty("realDurationMin", remoteProps.optString("realDurationMin", "0"));
+        }
 
-            String fileName = fileObj.getString("name");
-            String downloadUrl = fileObj.optString("download_url");
-            String sha = fileObj.optString("sha");
+        props.setProperty("selectedVoice", "0");
+        props.setProperty("author", music.authorName);
+        props.setProperty("musicName", music.musicName);
+        props.setProperty("audioExtension", audioFormat);
+        props.setProperty(PROP_LAST_SYNC, getCurrentTimestamp());
 
-            if (downloadUrl.isEmpty()) {
-                System.err.println("  ⚠️  Sem download_url para: " + fileName);
-                continue;
-            }
+        saveProperties(configFile, props);
+    }
 
-            if (fileName.endsWith(".xml")) {
-                xmlPath = downloadUrl;
-                xmlSha = sha;
-            } else if (fileName.endsWith(".properties")) {
-                configPath = downloadUrl;
-                configSha = sha;
-            } else if (isAudioFile(fileName)) {
-                audioPath = downloadUrl;
-                audioSha = sha;
+    private static String generateMusicKey(String author, String musicName) {
+        String finalName = musicName;
+
+        if (musicName.contains(" - ")) {
+            String[] parts = musicName.split(" - ", 2);
+            if (parts.length == 2 && parts[0].equalsIgnoreCase(author.trim())) {
+                finalName = parts[1];
             }
         }
 
-        if (xmlPath == null) {
-            throw new Exception("XML não encontrado para " + music.musicName);
-        }
-
-        boolean xmlNeedsUpdate = !xmlSha.equals(localProps.getProperty(PROP_XML_VERSION, ""));
-        boolean audioNeedsUpdate = audioPath != null && !audioSha.equals(localProps.getProperty(PROP_AUDIO_VERSION, ""));
-        boolean configNeedsUpdate = configPath != null && !configSha.equals(localProps.getProperty(PROP_CONFIG_VERSION, ""));
-        boolean isFirstDownload = !configFile.exists();
-
-        if (!xmlNeedsUpdate && !audioNeedsUpdate && !configNeedsUpdate && !isFirstDownload) {
-            return 2;
-        }
-
-        if (configPath != null && (configNeedsUpdate || isFirstDownload)) {
-            File tempConfigFile = new File(musicFolder, getFileName(music) + ".properties.tmp");
-            downloadFile(fixDownloadUrl(configPath), tempConfigFile);
-
-            localProps = loadProperties(tempConfigFile);
-
-            String prevXmlVersion = loadProperties(configFile).getProperty(PROP_XML_VERSION, "");
-            String prevAudioVersion = loadProperties(configFile).getProperty(PROP_AUDIO_VERSION, "");
-            if (!prevXmlVersion.isEmpty()) localProps.setProperty(PROP_XML_VERSION, prevXmlVersion);
-            if (!prevAudioVersion.isEmpty()) localProps.setProperty(PROP_AUDIO_VERSION, prevAudioVersion);
-
-            tempConfigFile.renameTo(configFile);
-            localProps.setProperty(PROP_CONFIG_VERSION, configSha);
-        }
-
-        if (xmlNeedsUpdate || isFirstDownload) {
-            downloadFile(fixDownloadUrl(xmlPath), new File(musicFolder, getFileName(music) + ".xml"));
-            localProps.setProperty(PROP_XML_VERSION, xmlSha);
-        }
-
-        if (audioPath != null && (audioNeedsUpdate || isFirstDownload)) {
-            String ext = audioPath.substring(audioPath.lastIndexOf('.') + 1).toLowerCase();
-            downloadFile(fixDownloadUrl(audioPath), new File(musicFolder, getFileName(music) + "." + ext));
-            localProps.setProperty(PROP_AUDIO_VERSION, audioSha);
-            localProps.setProperty("audioExtension", ext);
-        }
-
-        if (!localProps.containsKey("author")) {
-            localProps.setProperty("author", music.authorName);
-        }
-        if (!localProps.containsKey("musicName")) {
-            localProps.setProperty("musicName", music.musicName);
-        }
-
-        localProps.setProperty(PROP_LAST_SYNC, new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
-
-        if (!localProps.containsKey("audioExtension")) {
-            localProps.setProperty("audioExtension", "");
-        }
-        if (!localProps.containsKey("selectedVoice")) {
-            localProps.setProperty("selectedVoice", "0");
-        }
-
-        saveProperties(configFile, localProps);
-
-        return isFirstDownload ? 0 : 1;
-    }
-
-    private static File findAudioFileInFolder(File folder) {
-        File[] files = folder.listFiles((d, n) -> {
-            String lower = n.toLowerCase();
-            return lower.endsWith(".opus") || lower.endsWith(".mp3") ||
-                    lower.endsWith(".wav") || lower.endsWith(".ogg") ||
-                    lower.endsWith(".flac") || lower.endsWith(".aac");
-        });
-        if (files != null && files.length > 0) {
-            return files[0];
-        }
-        return null;
-    }
-
-    private static String getFileName(MusicToDownload music) {
-        return getFileName(music.authorName, music.musicName);
-    }
-
-    private static String getFileName(String authorName, String musicName) {
-        String combined = authorName.trim() + "-" + musicName.trim();
+        String combined = author.trim() + "_" + finalName.trim();
         String normalized = java.text.Normalizer.normalize(combined, java.text.Normalizer.Form.NFD);
         normalized = normalized.replaceAll("\\p{M}", "");
         normalized = normalized.toLowerCase();
@@ -640,36 +343,110 @@ public class GitHubSyncManager {
         return normalized;
     }
 
-    private static File getMusicFolder(String author, String musicName) {
-        String safeAuthor = safeName(author);
-        String safeMusic = safeName(musicName);
-        String rootFolder = System.getProperty("user.home") + File.separator + "KaraokeMusicas"
-                + File.separator + "Aliança Vocal";
-        return new File(rootFolder + File.separator + safeAuthor + File.separator + safeMusic);
+    private static String calculateFileHash(File file) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] fileBytes = Files.readAllBytes(file.toPath());
+        byte[] hashBytes = md.digest(fileBytes);
+        StringBuilder sb = new StringBuilder();
+        for (byte b : hashBytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
     }
 
-    private static String safeName(String name) {
-        return name.trim()
-                .replaceAll("[\\\\/:*?\"<>|]", "_")
-                .replaceAll("\\s+", " ");
+    private static String normalizeNumeric(String value) {
+        try {
+            return String.valueOf(Double.parseDouble(value.trim().replace(",", ".")));
+        } catch (NumberFormatException e) {
+            return "0";
+        }
     }
 
-    private static Properties loadProperties(File file) {
-        Properties props = new Properties();
-        if (file.exists()) {
-            try (FileInputStream fis = new FileInputStream(file)) {
-                props.load(fis);
-            } catch (IOException ex) {
-                System.err.println("  ⚠️  Erro ao ler propriedades: " + ex.getMessage());
+    private static String buildMusicFileUrl(String author, String musicName, String fileName) throws Exception {
+        String authorEncoded = URLEncoder.encode(author, StandardCharsets.UTF_8).replace("+", "%20");
+        String musicEncoded = URLEncoder.encode(musicName, StandardCharsets.UTF_8).replace("+", "%20");
+        String fileEncoded = URLEncoder.encode(fileName, StandardCharsets.UTF_8).replace("+", "%20");
+
+        return "https://raw.githubusercontent.com/seblutzer/alianca_vocal_musics_files/refs/heads/main/Alian%C3%A7a%20Vocal/" +
+                authorEncoded + "/" + musicEncoded + "/" + fileEncoded;
+    }
+
+    private static String downloadTextFile(String downloadUrl) throws Exception {
+        downloadUrl = fixGitHubRawUrl(downloadUrl);
+
+        URL url = new URL(downloadUrl);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(15000);
+        conn.setRequestProperty("User-Agent", "Java-GitHubSync/1.0");
+
+        int responseCode = conn.getResponseCode();
+        if (responseCode != 200) {
+            throw new Exception("HTTP " + responseCode);
+        }
+
+        StringBuilder content = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                content.append(line).append("\n");
+            }
+        } finally {
+            conn.disconnect();
+        }
+
+        return content.toString();
+    }
+
+    private static String fixGitHubRawUrl(String downloadUrl) throws Exception {
+        if (downloadUrl.contains("/refs/heads/")) {
+            return downloadUrl;
+        }
+
+        String[] urlParts = downloadUrl.split("raw\\.githubusercontent\\.com/", 2);
+        if (urlParts.length != 2) {
+            return downloadUrl;
+        }
+
+        String afterDomain = urlParts[1];
+        String[] pathParts = afterDomain.split("/", 4);
+
+        if (pathParts.length < 4) {
+            return downloadUrl;
+        }
+
+        String user = pathParts[0];
+        String repo = pathParts[1];
+        String branch = pathParts[2];
+        String filePath = pathParts[3];
+
+        String decodedFilePath = java.net.URLDecoder.decode(filePath, StandardCharsets.UTF_8);
+        String encodedPath = encodePathCorrectly(decodedFilePath);
+
+        return String.format("https://raw.githubusercontent.com/%s/%s/refs/heads/%s/%s",
+                user, repo, branch, encodedPath);
+    }
+
+    private static String encodePathCorrectly(String path) throws Exception {
+        StringBuilder encoded = new StringBuilder();
+        byte[] bytes = path.getBytes(StandardCharsets.UTF_8);
+
+        for (byte b : bytes) {
+            char c = (char) (b & 0xFF);
+
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                    c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ',') {
+                encoded.append(c);
+            } else if (c == ' ') {
+                encoded.append("%20");
+            } else {
+                encoded.append(String.format("%%%02X", b & 0xFF));
             }
         }
-        return props;
-    }
 
-    private static void saveProperties(File file, Properties props) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            props.store(fos, "Karaoke config — " + props.getProperty("author", "?") + " - " + props.getProperty("musicName", "?"));
-        }
+        return encoded.toString();
     }
 
     private static void downloadFile(String urlStr, File dest) throws Exception {
@@ -682,7 +459,7 @@ public class GitHubSyncManager {
 
         int responseCode = conn.getResponseCode();
         if (responseCode != 200) {
-            throw new Exception("HTTP " + responseCode + " ao baixar: " + urlStr);
+            throw new Exception("HTTP " + responseCode);
         }
 
         try (InputStream in = conn.getInputStream();
@@ -697,111 +474,74 @@ public class GitHubSyncManager {
         }
     }
 
-    private static Object getJsonResponse(String urlStr) throws Exception {
-        if (!urlStr.contains("?")) {
-            urlStr += "?ref=" + REF;
-        }
-
-        URL url = new URL(urlStr);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(15000);
-        conn.setRequestProperty("User-Agent", "Java-GitHubSync/1.0");
-
-        if (GITHUB_TOKEN != null && !GITHUB_TOKEN.isEmpty()) {
-            conn.setRequestProperty("Authorization", "token " + GITHUB_TOKEN);
-        }
-
-        int responseCode = conn.getResponseCode();
-
-        if (responseCode == 403) {
-            String rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining");
-            String rateLimitReset = conn.getHeaderField("X-RateLimit-Reset");
-            throw new Exception("Rate limit atingido. Restante: " + rateLimitRemaining +
-                    " | Reset em: " + rateLimitReset);
-        }
-
-        if (responseCode != 200) {
-            InputStream errorStream = conn.getErrorStream();
-            String errorMsg = "HTTP " + responseCode;
-            if (errorStream != null) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(errorStream, StandardCharsets.UTF_8))) {
-                    String line = reader.readLine();
-                    if (line != null) {
-                        JSONObject error = new JSONObject(line);
-                        errorMsg += " - " + error.optString("message", "");
-                    }
-                }
+    private static Properties loadProperties(File file) {
+        Properties props = new Properties();
+        if (file.exists()) {
+            try (FileInputStream fis = new FileInputStream(file)) {
+                props.load(fis);
+            } catch (IOException ex) {
+                System.err.println("⚠️  Erro ao ler: " + ex.getMessage());
             }
-            throw new Exception("Erro ao conectar ao GitHub: " + errorMsg);
         }
+        return props;
+    }
 
-        try (InputStream in = conn.getInputStream();
-             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
+    private static void saveProperties(File file, Properties props) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            props.store(fos, "Karaoke Config");
+        }
+    }
+
+    private static List<MusicLibrary.SavedMusic> getAllLocalMusics() {
+        return MusicLibrary.listAll();
+    }
+
+    private static File getMusicFolder(String author, String musicName) {
+        String cleanMusicName = extractMusicName(author, musicName);
+        String safeAuthor = author.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+        String safeMusic = cleanMusicName.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+
+        return new File(System.getProperty("user.home") + "/KaraokeMusicas/Aliança Vocal/" + safeAuthor + "/" + safeMusic);
+    }
+
+    private static String extractMusicName(String author, String fullName) {
+        if (fullName.contains(" - ")) {
+            String[] parts = fullName.split(" - ", 2);
+            if (parts.length == 2 && parts[0].equalsIgnoreCase(author.trim())) {
+                return parts[1];
             }
-
-            String content = sb.toString().trim();
-
-            if (content.startsWith("[")) {
-                return new JSONArray(content);
-            } else if (content.startsWith("{")) {
-                return new JSONObject(content);
-            } else {
-                throw new Exception("Resposta JSON inválida");
-            }
-        } finally {
-            conn.disconnect();
         }
+        return fullName;
     }
 
-    private static JSONArray getJsonArray(String urlStr) throws Exception {
-        Object response = getJsonResponse(urlStr);
-        if (response instanceof JSONArray) {
-            return (JSONArray) response;
-        } else {
-            throw new Exception("Esperado JSONArray, recebido JSONObject");
-        }
+    private static String getFileName(String author, String musicName) {
+        String cleanMusicName = extractMusicName(author, musicName);
+        String authorKey = normalizeForFileName(author);
+        String musicKey = normalizeForFileName(cleanMusicName);
+        return authorKey + "-" + musicKey;
     }
 
-    private static String fixDownloadUrl(String downloadUrl) throws Exception {
-        String withRefHeads = downloadUrl.replace("/main/", "/refs/heads/main/");
-
-        String[] parts = withRefHeads.split("/refs/heads/main/", 2);
-        if (parts.length != 2) {
-            return withRefHeads;
-        }
-
-        String base = parts[0] + "/refs/heads/main/";
-        String pathPart = parts[1];
-
-        String decodedPath = java.net.URLDecoder.decode(pathPart, StandardCharsets.UTF_8);
-
-        String[] segments = decodedPath.split("/");
-        StringBuilder encodedPath = new StringBuilder();
-
-        for (int i = 0; i < segments.length; i++) {
-            if (i > 0) encodedPath.append("/");
-            String encoded = URLEncoder.encode(segments[i], StandardCharsets.UTF_8);
-            encoded = encoded.replace("+", "%20");
-            encodedPath.append(encoded);
-        }
-
-        return base + encodedPath.toString();
+    private static String normalizeForFileName(String text) {
+        String normalized = java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFD);
+        normalized = normalized.replaceAll("\\p{M}", "");
+        normalized = normalized.toLowerCase();
+        normalized = normalized.replaceAll("\\s+", "_");
+        normalized = normalized.replaceAll("[\\\\/:*?\"<>|]", "");  // ✅ Vírgula removida da blacklist
+        return normalized;
     }
 
-    private static boolean isAudioFile(String fileName) {
-        String lower = fileName.toLowerCase();
-        return lower.endsWith(".opus") || lower.endsWith(".mp3") ||
-                lower.endsWith(".wav") || lower.endsWith(".ogg") ||
-                lower.endsWith(".flac") || lower.endsWith(".aac");
+    private static File findAudioFileInFolder(File folder) {
+        File[] files = folder.listFiles((d, n) -> {
+            String lower = n.toLowerCase();
+            return lower.endsWith(".opus") || lower.endsWith(".mp3") ||
+                    lower.endsWith(".wav") || lower.endsWith(".ogg");
+        });
+        return (files != null && files.length > 0) ? files[0] : null;
     }
 
-    // ── Classe interna ────────────────────────────────────────────────────────
+    private static String getCurrentTimestamp() {
+        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+    }
 
     private static class MusicToDownload {
         String authorName;

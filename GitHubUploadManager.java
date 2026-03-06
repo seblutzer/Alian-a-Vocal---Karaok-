@@ -8,17 +8,14 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
 import java.util.*;
 
 /**
- * Gerencia upload inteligente de músicas para o repositório GitHub.
- *
- * Recursos:
+ * Gerencia upload inteligente de músicas para o repositório GitHub
  * - Compara hash SHA-256 dos arquivos locais vs remotos
  * - Só faz upload dos arquivos que mudaram
- * - Upload de XML, áudio E configuração (.properties)
- * - Criação automática de estrutura de pastas
- * - Versionamento com SHA do GitHub
+ * - Atualiza sync-manifest.json automaticamente
  */
 public class GitHubUploadManager {
 
@@ -28,16 +25,14 @@ public class GitHubUploadManager {
     private static final String REF = GitHubConfigManager.getRef();
     private static final long RATE_LIMIT_DELAY = GitHubConfigManager.getUploadRateLimit();
 
+    private static final String MANIFEST_FILE_NAME = "sync-manifest.json";
+
     public interface UploadListener {
         void onProgress(String message, int current, int total);
         void onError(String error);
         void onComplete(boolean success, String message);
     }
 
-    /**
-     * Inicia upload inteligente de uma música para GitHub
-     * Verifica mudanças antes de fazer upload
-     */
     public static void uploadMusic(MusicLibrary.SavedMusic music, UploadListener listener) {
         new Thread(() -> {
             try {
@@ -50,22 +45,18 @@ public class GitHubUploadManager {
         }).start();
     }
 
-    // ── Métodos privados ──────────────────────────────────────────────────────
-
     private static void uploadMusicInternal(MusicLibrary.SavedMusic music, UploadListener listener) throws Exception {
         if (music.xmlFile == null || !music.xmlFile.exists()) {
             throw new FileNotFoundException("XML não encontrado");
         }
 
-        // Estrutura: Aliança Vocal/Autor/MúsicaNome/
         String aliancaPath = "Alian%C3%A7a%20Vocal";
         String authorPath = encodePathSegment(music.author);
-        String musicPath = encodePathSegment(music.name.split(" - ")[1]);
+        String musicPath = encodePathSegment(music.name.split(" - ")[1].trim());
         String remoteMusicPath = aliancaPath + "/" + authorPath + "/" + musicPath;
 
         listener.onProgress("Verificando mudanças...", 0, 0);
 
-        // ✅ NOVO: Analisar quais arquivos mudaram
         Map<String, FileStatus> fileStatus = analyzeFiles(music, remoteMusicPath);
 
         List<FileToUpload> filesToUpload = new ArrayList<>();
@@ -76,13 +67,12 @@ public class GitHubUploadManager {
         }
 
         if (filesToUpload.isEmpty()) {
-            listener.onComplete(true, "✓ Nenhuma mudança detectada - arquivo já está atualizado!");
+            listener.onComplete(true, "✓ Nenhuma mudança detectada");
             return;
         }
 
         listener.onProgress("Preparando " + filesToUpload.size() + " arquivo(s)...", 0, filesToUpload.size());
 
-        // ✅ Fazer upload apenas dos arquivos que mudaram
         int uploaded = 0;
         for (FileToUpload fileToUpload : filesToUpload) {
             uploaded++;
@@ -92,74 +82,42 @@ public class GitHubUploadManager {
             Thread.sleep(RATE_LIMIT_DELAY);
         }
 
-        String summary = String.format("✓ %d arquivo(s) enviado(s) com sucesso!", filesToUpload.size());
+        try {
+            updateManifestWithMusic(music, remoteMusicPath, listener);
+        } catch (Exception ex) {
+            System.err.println("⚠️ Não foi possível atualizar manifest: " + ex.getMessage());
+        }
+
+        String summary = String.format("✓ %d arquivo(s) enviado(s)", filesToUpload.size());
         listener.onComplete(true, summary);
     }
 
-    /**
-     * ✅ NOVO: Analisa quais arquivos mudaram comparando hashes
-     */
     private static Map<String, FileStatus> analyzeFiles(MusicLibrary.SavedMusic music, String remoteMusicPath) throws Exception {
         Map<String, FileStatus> status = new HashMap<>();
 
-        // Arquivos locais
-        File xmlFile = music.xmlFile;
-        File audioFile = music.audioFile;
+        addFileStatus(status, "XML", music.xmlFile, remoteMusicPath);
+
+        if (music.audioFile != null && music.audioFile.exists()) {
+            addFileStatus(status, "Áudio", music.audioFile, remoteMusicPath);
+        }
+
         File propsFile = findPropertiesFile(music.folder);
-
-        // Calcula hashes locais
-        String xmlLocalHash = calculateFileHash(xmlFile);
-        String audioLocalHash = audioFile != null ? calculateFileHash(audioFile) : null;
-        String propsLocalHash = propsFile != null ? calculateFileHash(propsFile) : null;
-
-        // ✅ Verificar XML
-        String xmlRemoteHash = getRemoteFileHash(remoteMusicPath + "/" + xmlFile.getName());
-        boolean xmlChanged = !xmlLocalHash.equals(xmlRemoteHash);
-        status.put("XML", new FileStatus(xmlFile, xmlRemoteHash, xmlChanged, remoteMusicPath));
-
-        // ✅ Verificar Áudio
-        if (audioFile != null && audioFile.exists()) {
-            String audioRemoteHash = getRemoteFileHash(remoteMusicPath + "/" + audioFile.getName());
-            boolean audioChanged = !audioLocalHash.equals(audioRemoteHash);
-            status.put("Áudio", new FileStatus(audioFile, audioRemoteHash, audioChanged, remoteMusicPath));
-        }
-
-        // ✅ Verificar Properties
         if (propsFile != null && propsFile.exists()) {
-            String propsRemoteHash = getRemoteFileHash(remoteMusicPath + "/" + propsFile.getName());
-            boolean propsChanged = !propsLocalHash.equals(propsRemoteHash);
-            status.put("Properties", new FileStatus(propsFile, propsRemoteHash, propsChanged, remoteMusicPath));
+            addFileStatus(status, "Properties", propsFile, remoteMusicPath);
         }
-
-        // Log das mudanças (✅ CORRIGIDO: Safe substring)
-        System.out.println("\n=== ANÁLISE DE MUDANÇAS ===");
-        for (Map.Entry<String, FileStatus> entry : status.entrySet()) {
-            String indicator = entry.getValue().hasChanged ? "⭕ MUDOU" : "✓ OK";
-            String localHashShort = safeSubstring(entry.getValue().localHash, 0, 8);
-            String remoteHashShort = entry.getValue().remoteHash != null && !entry.getValue().remoteHash.isEmpty()
-                    ? safeSubstring(entry.getValue().remoteHash, 0, 8)
-                    : "NOVO";
-            System.out.println(indicator + " - " + entry.getKey() + " (local: " + localHashShort + " | remoto: " + remoteHashShort + ")");
-        }
-        System.out.println();
 
         return status;
     }
 
-    /**
-     * ✅ NOVO: Substring seguro que não lança exceção
-     */
-    private static String safeSubstring(String str, int start, int end) {
-        if (str == null || str.isEmpty()) {
-            return "VAZIO";
-        }
-        int actualEnd = Math.min(end, str.length());
-        return str.substring(start, actualEnd);
+    private static void addFileStatus(Map<String, FileStatus> status, String label, File file,
+                                      String remoteMusicPath) throws Exception {
+        String localHash = calculateFileHash(file);
+        String remoteHash = getRemoteFileHash(remoteMusicPath + "/" + file.getName());
+        boolean hasChanged = !localHash.equals(remoteHash);
+
+        status.put(label, new FileStatus(file, remoteHash, hasChanged, remoteMusicPath));
     }
 
-    /**
-     * ✅ NOVO: Calcula SHA-256 de um arquivo local
-     */
     private static String calculateFileHash(File file) throws Exception {
         if (file == null || !file.exists()) {
             return "";
@@ -174,7 +132,10 @@ public class GitHubUploadManager {
             }
         }
 
-        byte[] hashBytes = digest.digest();
+        return formatHash(digest.digest());
+    }
+
+    private static String formatHash(byte[] hashBytes) {
         StringBuilder hashString = new StringBuilder();
         for (byte b : hashBytes) {
             hashString.append(String.format("%02x", b));
@@ -182,19 +143,13 @@ public class GitHubUploadManager {
         return hashString.toString();
     }
 
-    /**
-     * ✅ NOVO: Obtém hash do arquivo remoto
-     * Faz download do arquivo remoto e calcula hash
-     * Retorna vazio se não existir
-     */
     private static String getRemoteFileHash(String remotePath) throws Exception {
         try {
             String downloadUrl = getRemoteFileDownloadUrl(remotePath);
             if (downloadUrl == null) {
-                return ""; // Arquivo não existe no remoto
+                return "";
             }
 
-            // Faz download temporário e calcula hash
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             URL url = new URL(downloadUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -213,27 +168,26 @@ public class GitHubUploadManager {
                 conn.disconnect();
             }
 
-            byte[] fileContent = baos.toByteArray();
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            digest.update(fileContent);
-
-            byte[] hashBytes = digest.digest();
-            StringBuilder hashString = new StringBuilder();
-            for (byte b : hashBytes) {
-                hashString.append(String.format("%02x", b));
-            }
-            return hashString.toString();
+            digest.update(baos.toByteArray());
+            return formatHash(digest.digest());
 
         } catch (Exception ex) {
-            // Se não conseguir baixar, considera como "não existe"
             return "";
         }
     }
 
-    /**
-     * ✅ NOVO: Obtém a URL de download de um arquivo remoto
-     */
     private static String getRemoteFileDownloadUrl(String remotePath) throws Exception {
+        JSONObject response = getGitHubApiResponse(remotePath);
+        return response != null ? response.optString("download_url", null) : null;
+    }
+
+    private static String getRemoteFileSha(String remotePath) throws Exception {
+        JSONObject response = getGitHubApiResponse(remotePath);
+        return response != null ? response.optString("sha", null) : null;
+    }
+
+    private static JSONObject getGitHubApiResponse(String remotePath) throws Exception {
         String url = GITHUB_API_URL + "/" + remotePath + "?ref=" + REF;
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
@@ -245,11 +199,8 @@ public class GitHubUploadManager {
 
         int responseCode = conn.getResponseCode();
 
-        if (responseCode == 404) {
-            return null; // Arquivo não existe
-        }
-
-        if (responseCode != 200) {
+        if (responseCode == 404 || responseCode != 200) {
+            conn.disconnect();
             return null;
         }
 
@@ -260,85 +211,23 @@ public class GitHubUploadManager {
             while ((line = reader.readLine()) != null) {
                 sb.append(line);
             }
-
-            JSONObject obj = new JSONObject(sb.toString());
-            return obj.optString("download_url", null);
+            return new JSONObject(sb.toString());
         } finally {
             conn.disconnect();
         }
     }
 
-    /**
-     * Faz upload de um arquivo individual para GitHub
-     */
     private static void uploadFile(File file, String remotePath, FileStatus status) throws Exception {
-        String fileName = file.getName();
-        String fullPath = remotePath + "/" + fileName;
-
-        // Lê arquivo e codifica em Base64
+        String fullPath = remotePath + "/" + file.getName();
         byte[] fileContent = Files.readAllBytes(file.toPath());
         String base64Content = Base64.getEncoder().encodeToString(fileContent);
 
-        // Se arquivo já existe, usa o SHA anterior para update
-        String message = status.remoteSha != null && !status.remoteSha.isEmpty()
-                ? "Atualizar: " + fileName + " (mudança detectada)"
-                : "Adicionar: " + fileName + " (novo)";
+        String action = status.remoteSha != null && !status.remoteSha.isEmpty() ? "Atualizar" : "Adicionar";
+        String message = action + ": " + file.getName();
 
         uploadToGitHub(fullPath, base64Content, status.remoteSha, message);
     }
 
-    /**
-     * Encontra o arquivo .properties na pasta da música
-     */
-    private static File findPropertiesFile(File folder) {
-        File[] files = folder.listFiles((d, n) -> n.endsWith(".properties"));
-        if (files != null && files.length > 0) {
-            return files[0];
-        }
-        return null;
-    }
-
-    /**
-     * Obtém o SHA do GitHub para um arquivo (para fazer update)
-     */
-    private static String getRemoteFileSha(String remotePath) throws Exception {
-        String url = GITHUB_API_URL + "/" + remotePath + "?ref=" + REF;
-
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(10000);
-        conn.setRequestProperty("User-Agent", "Java-GitHubUpload/1.0");
-        conn.setRequestProperty("Authorization", "token " + GITHUB_TOKEN);
-
-        int responseCode = conn.getResponseCode();
-
-        if (responseCode == 404) {
-            return null;
-        }
-
-        if (responseCode != 200) {
-            return null;
-        }
-
-        try (InputStream in = conn.getInputStream();
-             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
-            }
-
-            JSONObject obj = new JSONObject(sb.toString());
-            return obj.optString("sha", null);
-        } finally {
-            conn.disconnect();
-        }
-    }
-
-    /**
-     * Faz upload/atualização de um arquivo no GitHub
-     */
     private static void uploadToGitHub(String remotePath, String base64Content,
                                        String existingSha, String message) throws Exception {
         String url = GITHUB_API_URL + "/" + remotePath;
@@ -348,12 +237,8 @@ public class GitHubUploadManager {
         payload.put("content", base64Content);
         payload.put("branch", REF);
 
-        // ✅ CORRIGIDO: Só adiciona SHA se não for null E não for vazio
         if (existingSha != null && !existingSha.trim().isEmpty()) {
             payload.put("sha", existingSha);
-            System.out.println("  ✓ Atualizando com SHA: " + existingSha.substring(0, 8));
-        } else {
-            System.out.println("  ✓ Criando novo arquivo (sem SHA)");
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
@@ -373,10 +258,11 @@ public class GitHubUploadManager {
         int responseCode = conn.getResponseCode();
 
         if (responseCode != 201 && responseCode != 200) {
-            InputStream errorStream = conn.getErrorStream();
             String errorMsg = "HTTP " + responseCode;
+            InputStream errorStream = conn.getErrorStream();
             if (errorStream != null) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(errorStream, StandardCharsets.UTF_8))) {
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(errorStream, StandardCharsets.UTF_8))) {
                     String line = reader.readLine();
                     if (line != null) {
                         try {
@@ -394,46 +280,74 @@ public class GitHubUploadManager {
         conn.disconnect();
     }
 
-    /**
-     * Codifica um segmento de path para URL (compatível com GitHub)
-     */
-    private static String encodePathSegment(String segment) throws Exception {
-        String encoded = URLEncoder.encode(segment, StandardCharsets.UTF_8);
-        return encoded.replace("+", "%20");
+    private static void updateManifestWithMusic(MusicLibrary.SavedMusic music,
+                                                String remoteMusicPath, UploadListener listener) throws Exception {
+        listener.onProgress("Atualizando manifest...", 0, 0);
+        ManifestCreator.updateManifestWithSingleMusic(music, remoteMusicPath);
     }
 
-    // ── Classes internas ──────────────────────────────────────────────────────
+    private static File findPropertiesFile(File folder) {
+        File[] files = folder.listFiles((d, n) -> n.endsWith(".properties"));
+        return (files != null && files.length > 0) ? files[0] : null;
+    }
 
-    /**
-     * Status de um arquivo (se mudou ou não)
-     */
+    private static String encodePathSegment(String segment) throws Exception {
+        return URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    private static String downloadTextFile(String urlStr) throws Exception {
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(15000);
+        conn.setRequestProperty("User-Agent", "Java-GitHubUpload/1.0");
+
+        if (GITHUB_TOKEN != null && !GITHUB_TOKEN.isEmpty()) {
+            conn.setRequestProperty("Authorization", "token " + GITHUB_TOKEN);
+        }
+
+        int responseCode = conn.getResponseCode();
+        if (responseCode != 200) {
+            throw new Exception("HTTP " + responseCode);
+        }
+
+        try (InputStream in = conn.getInputStream();
+             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+            return sb.toString();
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    private static String getCurrentTimestamp() {
+        return new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'").format(new Date());
+    }
+
     private static class FileStatus {
         File file;
         String remoteHash;
         String remoteSha;
-        String localHash;
         boolean hasChanged;
 
         FileStatus(File file, String remoteHash, boolean hasChanged, String remoteMusicPath) throws Exception {
             this.file = file;
             this.remoteHash = remoteHash;
             this.hasChanged = hasChanged;
-            this.localHash = calculateFileHash(file);
-            this.remoteSha = null; // ✅ Inicializa como null
 
-            // ✅ CORRIGIDO: Sempre tenta obter SHA, mesmo que hash esteja vazio
             try {
                 this.remoteSha = getRemoteFileSha(remoteMusicPath + "/" + file.getName());
             } catch (Exception ex) {
-                System.err.println("⚠️  Não foi possível obter SHA remoto: " + ex.getMessage());
                 this.remoteSha = null;
             }
         }
     }
 
-    /**
-     * Arquivo pronto para upload
-     */
     private static class FileToUpload {
         String name;
         File file;
