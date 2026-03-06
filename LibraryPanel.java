@@ -35,6 +35,7 @@ public class LibraryPanel extends JPanel {
 
     private JButton saveBtn;
     private JButton convertAllBtn;
+    private JButton refreshBtn;
     private String currentCoral = null;
 
     private long pressTime = 0;
@@ -106,31 +107,11 @@ public class LibraryPanel extends JPanel {
         });
         titleRow.add(sortToggleBtn, BorderLayout.CENTER);
 
-        JButton refreshBtn = smallButton("🔄", new Color(52, 73, 94));
+        refreshBtn = smallButton("🔄", new Color(52, 73, 94)); // <--- Mude aqui para atribuir ao campo
         refreshBtn.setToolTipText("Atualizar lista");
         refreshBtn.addActionListener(e -> {
             refreshBtn.setEnabled(false);
-            refresh();
-
-            // ✅ NOVO: Verificar se é primeira sincronização
-            new Thread(() -> {
-                try {
-                    // Tentar baixar manifest
-                    ManifestCreator.downloadManifest();
-
-                    // ✅ Manifest existe - fazer sync normal
-                    SwingUtilities.invokeLater(() -> {
-                        syncWithGitHubNormal(refreshBtn);
-                    });
-
-                } catch (Exception ex) {
-                    // ✅ Manifest não existe - gerar completo (primeira vez)
-                    System.err.println("⚠️  Primeira sincronização detectada!");
-                    SwingUtilities.invokeLater(() -> {
-                        generateManifestAndSync(refreshBtn);
-                    });
-                }
-            }).start();
+            startGitHubSync(refreshBtn); // Chama o novo método auxiliar
         });
         titleRow.add(refreshBtn, BorderLayout.EAST);
 
@@ -373,6 +354,37 @@ public class LibraryPanel extends JPanel {
     }
 
     // ── Refresh e atualização ─────────────────────────────────────────────────
+
+    private void startGitHubSync(JButton buttonToEnable) {
+        new Thread(() -> {
+            try {
+                // Tentar baixar manifest (verifica se o manifest já existe localmente)
+                ManifestCreator.downloadManifest();
+
+                // Manifest existe - fazer sync normal
+                SwingUtilities.invokeLater(() -> {
+                    syncWithGitHubNormal(buttonToEnable);
+                });
+
+            } catch (Exception ex) {
+                // Manifest não existe ou houve erro - gerar completo (primeira vez)
+                System.err.println("⚠️  Primeira sincronização detectada!");
+                SwingUtilities.invokeLater(() -> {
+                    generateManifestAndSync(buttonToEnable);
+                });
+            }
+        }).start();
+    }
+
+    public void triggerAutoSync() {
+        if (refreshBtn != null) {
+            refreshBtn.setEnabled(false);
+        }
+        // Primeiro, atualiza a lista local e os corais
+        refresh();
+        // Em seguida, inicia a sincronização com o GitHub
+        startGitHubSync(refreshBtn);
+    }
 
     public void refresh() {
         // Atualiza lista de corais

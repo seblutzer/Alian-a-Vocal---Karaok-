@@ -152,6 +152,14 @@ public class KaraokeApp extends JFrame {
         setSize(1200, 850);
         setLocationRelativeTo(null);
         createWidgets();
+
+        // ── NOVO: Aciona a sincronização automática da biblioteca ao iniciar ──
+        SwingUtilities.invokeLater(() -> {
+            if (libraryPanel != null) {
+                System.out.println("KaraokeApp: Acionando sincronização automática da biblioteca...");
+                libraryPanel.triggerAutoSync();
+            }
+        });
     }
 
     private void setupAudioListeners() {
